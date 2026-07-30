@@ -5,3 +5,14 @@ pymupdf
 langchain-text-splitters
 pytest
 httpx
+
+# Database & vector engine
+sqlalchemy[asyncio]
+asyncpg
+pgvector
+alembic
+python-dotenv
+
+# Async test support (SQLite mock DB for ORM tests)
+aiosqlite
+pytest-asyncio

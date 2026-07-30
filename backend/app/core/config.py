@@ -1,18 +1,23 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Resolve .env relative to the backend/ directory so it loads regardless of
+# the working directory the app or tests are invoked from.
+ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables / .env."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
     # General
     app_name: str = "SourceGuard"
     environment: str = "development"
 
-    # Database
+    # Database (loaded from DATABASE_URL in .env)
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/sourceguard"
 
     # Redis / Upstash cache
