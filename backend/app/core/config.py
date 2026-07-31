@@ -7,6 +7,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # the working directory the app or tests are invoked from.
 ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
+# Fixed by the pgvector column schema (app/models/chunk.py). Not environment
+# configurable: changing this requires a DB migration, not a .env edit.
+EMBEDDING_DIMENSIONS = 1536
+
 
 class Settings(BaseSettings):
     """Application configuration loaded from environment variables / .env."""
@@ -26,6 +30,8 @@ class Settings(BaseSettings):
     # AI providers
     groq_api_key: str = ""
     together_api_key: str = ""
+    together_api_base: str = "https://api.together.xyz/v1"
+    embedding_model: str = "togethercomputer/m2-bert-80M-32k-retrieval"
 
     # Chunking defaults
     chunk_size: int = 1000

@@ -10,6 +10,9 @@ class PortableVector(TypeDecorator):
 
     impl = Text
     cache_ok = True
+    # Exposes .cosine_distance() / .l2_distance() / .max_inner_product() on the
+    # mapped column for query building, regardless of the underlying dialect.
+    comparator_factory = Vector.Comparator
 
     def __init__(self, dimensions: int, *args, **kwargs) -> None:
         self.dimensions = dimensions
