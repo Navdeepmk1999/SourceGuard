@@ -5,10 +5,9 @@ from sqlalchemy import JSON, DateTime, ForeignKey, Integer, Text, Uuid, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.config import EMBEDDING_DIMENSIONS
 from app.models.base import Base
 from app.models.types import PortableVector
-
-EMBEDDING_DIMENSIONS = 1536
 
 
 class DocumentChunk(Base):

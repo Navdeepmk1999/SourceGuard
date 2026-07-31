@@ -16,3 +16,6 @@ python-dotenv
 # Async test support (SQLite mock DB for ORM tests)
 aiosqlite
 pytest-asyncio
+
+# Retrieval & verification core (embeddings via API, vector math)
+numpy
