@@ -19,3 +19,7 @@ pytest-asyncio
 
 # Retrieval & verification core (embeddings via API, vector math)
 numpy
+
+# API & streaming gateway
+sse-starlette
+python-multipart

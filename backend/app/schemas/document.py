@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 from enum import Enum
 
@@ -39,3 +40,20 @@ class ParsingResult(BaseModel):
     total_pages: int | None = None
     total_chunks: int
     chunks: list[DocumentChunk]
+
+
+class DocumentIngestSummary(BaseModel):
+    """Per-document result returned by the upload endpoint."""
+
+    document_id: uuid.UUID
+    filename: str
+    document_type: DocumentType
+    total_pages: int | None = None
+    total_chunks: int
+
+
+class DocumentUploadResponse(BaseModel):
+    """Response for a (possibly multi-file) document upload request."""
+
+    workspace_id: uuid.UUID
+    documents: list[DocumentIngestSummary]
