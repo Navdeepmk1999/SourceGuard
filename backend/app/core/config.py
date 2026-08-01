@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve .env relative to the backend/ directory so it loads regardless of
@@ -29,6 +30,8 @@ class Settings(BaseSettings):
 
     # AI providers
     groq_api_key: str = ""
+    groq_api_base: str = "https://api.groq.com/openai/v1"
+    groq_model: str = "llama-3.1-8b-instant"
     together_api_key: str = ""
     together_api_base: str = "https://api.together.xyz/v1"
     embedding_model: str = "togethercomputer/m2-bert-80M-32k-retrieval"
@@ -36,6 +39,16 @@ class Settings(BaseSettings):
     # Chunking defaults
     chunk_size: int = 1000
     chunk_overlap: int = 200
+
+    # CORS: origins allowed to call this API (comma-separated in .env)
+    cors_allowed_origins: list[str] = ["http://localhost:3000"]
+
+    @field_validator("cors_allowed_origins", mode="before")
+    @classmethod
+    def _split_comma_separated_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
 
 
 @lru_cache
