@@ -111,3 +111,31 @@ The column type that lets `DocumentChunk.embedding` be a genuine `pgvector` colu
 **CORS — `app/main.py`**
 - All three routers are wired via `app.include_router()`.
 - `CORSMiddleware` enforces a strict policy: an explicit origin allow-list (`settings.cors_allowed_origins`, default `["http://localhost:3000"]`, overridable in `.env` as a comma-separated string via a `field_validator`), `allow_credentials=True`, and methods/headers restricted to exactly what the API needs (`GET`, `POST`, `OPTIONS`; `Content-Type`, `Authorization`) — no wildcard origins, methods, or headers.
+
+---
+
+## Frontend Architecture (As-Built)
+
+**Framework & tooling**
+- Next.js 14+ (App Router), TypeScript (strict mode), Tailwind CSS v4 (CSS-first config via `@theme inline` in `src/app/globals.css` — no `tailwind.config.js`), Lucide React for icons.
+- Application code lives under `frontend/src/`: the CLI-generated `app/` directory was relocated to `src/app/` per Next.js's `src`-folder convention, since `src/app` is silently ignored whenever a root-level `app/` also exists. `tsconfig.json`'s `@/*` path alias resolves to `./src/*` accordingly.
+
+**Utility layer — `src/lib/utils.ts`**
+- `cn(...inputs: ClassValue[])` composes `clsx` (conditional class joining) with `tailwind-merge` (last-write-wins conflict resolution for Tailwind utilities — e.g. a later `w-16` correctly overrides an earlier `w-64` in the same class list rather than both being emitted). This is the single class-composition primitive used by every component with conditional or collapsed-state styling.
+
+**Structural layout**
+- `src/app/layout.tsx` (Root layout, Server Component): a fixed dark-mode-default shell — `zinc-950` background / `zinc-100` foreground applied directly, with no `prefers-color-scheme` branching or light theme. Renders the persistent `Sidebar` alongside a `min-w-0 flex-1` content region so routed pages fill the remaining width without overflow.
+- `src/components/Sidebar.tsx` (Client Component — requires local collapse state): toggles between a `w-64` expanded rail and a `w-16` icon-only collapsed rail; contains a "New Workspace" affordance and a "Workspaces" list section rendering an explicit empty state (`No workspaces yet.`). The list is currently backed by a static placeholder array, not a live fetch — wiring it to `GET /api/v1/workspaces` (Module 4) is deferred to the next pass.
+- `src/app/page.tsx` (Server Component): the dashboard shell, split via CSS grid into two panes — a Chat/Query pane (`minmax(0,1fr)`, disabled input, empty state) and a fixed-width (`360px`) Verification Audit Log pane. Both panes are structural placeholders anticipating the `POST /api/v1/query/stream` SSE contract (`event: token` / `event: verification` / `event: done`, per Module 4) without consuming it — no `EventSource`/`fetch` wiring exists in this pass.
+
+**Type contracts — `src/types/index.ts`**
+
+TypeScript interfaces are hand-mirrored from the backend's Python source of truth rather than generated, since no OpenAPI/codegen pipeline exists yet:
+- `Workspace` ← `app/models/workspace.py::Workspace` — `id` / `name` / `created_at`, 1:1 with the SQLAlchemy model's mapped columns.
+- `Document` ← `app/models/document.py::Document` — `document_type` narrowed to the `"pdf" | "txt"` literal union, mirroring `app/schemas/document.py::DocumentType`.
+- `DocumentChunk` ← `app/models/chunk.py::DocumentChunk` — the ORM attribute is `chunk_metadata` (mapped to the `metadata` DB column); the TS field is named `metadata` to match what an eventual response schema would expose, since no Pydantic response schema for this model exists yet.
+- `VerificationResult` / `ClaimVerification` ← `app/services/nli_verifier.py` dataclasses — field-for-field, including `EntailmentLabel` as the `"entailed" | "not_entailed" | "insufficient_evidence"` string union matching the Python `Enum`'s values.
+
+**Current state**
+- Purely structural: no `fetch`/`EventSource` calls exist anywhere in `frontend/src/` yet. `tsc --noEmit`, `eslint .`, and `next build` (Turbopack) all pass clean with zero warnings.
+- Next integration pass: `Sidebar` → `GET /api/v1/workspaces`; dashboard query input → `POST /api/v1/query/stream`, consuming its SSE events into the Chat/Query and Verification Audit Log panes.
