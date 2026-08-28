@@ -90,6 +90,7 @@ The column type that lets `DocumentChunk.embedding` be a genuine `pgvector` colu
 
 **Workspaces — `app/api/endpoints/workspaces.py`**
 - `POST /api/v1/workspaces` creates a `Workspace`; a duplicate name raises `IntegrityError`, which is caught and converted to `HTTPException(409)`.
+- `GET /api/v1/workspaces` (added in Module 5) lists every workspace newest-first via `select(Workspace).order_by(Workspace.created_at.desc())`, returning `list[WorkspaceRead]`. Both routes are registered on the path `""` rather than `"/"`: since the router already carries the `/api/v1/workspaces` prefix, `"/"` would resolve to `/api/v1/workspaces/` and trigger a FastAPI `307` redirect for the un-slashed URL the frontend requests — an extra hop that also interacts badly with the strict CORS allow-list.
 
 **Document upload — `app/api/endpoints/documents.py`**
 - `POST /api/v1/documents/upload` accepts a `workspace_id` form field and one or more `UploadFile`s (`python-multipart`). Looks up the workspace first (`HTTPException(404)` if it doesn't exist), then per file: reads the raw bytes, calls `DocumentParser.parse()` — inheriting all of Module 1's path-traversal and extension validation for free — persists a `Document` row, batch-embeds every chunk's content via `EmbeddingService.embed_batch()` (Module 3), and inserts one `DocumentChunk` row per chunk with its embedding and metadata. Any single invalid file in a multi-file batch raises immediately (fail-fast `HTTPException`), so a request either fully succeeds or is rejected outright — never partially ingested.
@@ -125,8 +126,20 @@ The column type that lets `DocumentChunk.embedding` be a genuine `pgvector` colu
 
 **Structural layout**
 - `src/app/layout.tsx` (Root layout, Server Component): a fixed dark-mode-default shell — `zinc-950` background / `zinc-100` foreground applied directly, with no `prefers-color-scheme` branching or light theme. Renders the persistent `Sidebar` alongside a `min-w-0 flex-1` content region so routed pages fill the remaining width without overflow.
-- `src/components/Sidebar.tsx` (Client Component — requires local collapse state): toggles between a `w-64` expanded rail and a `w-16` icon-only collapsed rail; contains a "New Workspace" affordance and a "Workspaces" list section rendering an explicit empty state (`No workspaces yet.`). The list is currently backed by a static placeholder array, not a live fetch — wiring it to `GET /api/v1/workspaces` (Module 4) is deferred to the next pass.
-- `src/app/page.tsx` (Server Component): the dashboard shell, split via CSS grid into two panes — a Chat/Query pane (`minmax(0,1fr)`, disabled input, empty state) and a fixed-width (`360px`) Verification Audit Log pane. Both panes are structural placeholders anticipating the `POST /api/v1/query/stream` SSE contract (`event: token` / `event: verification` / `event: done`, per Module 4) without consuming it — no `EventSource`/`fetch` wiring exists in this pass.
+- `src/components/Sidebar.tsx` (Client Component): toggles between a `w-64` expanded rail and a `w-16` icon-only collapsed rail. Consumes `WorkspaceContext` — fetches on mount, creates via `window.prompt` (a deliberate placeholder pending a real form), highlights the active workspace with `cn()`, and renders distinct loading / error-with-retry / empty (`No workspaces yet.`) states.
+- `src/app/page.tsx` (Client Component — reads `activeWorkspace` from context for its header): the dashboard shell, split via CSS grid into two panes — a Chat/Query pane (`minmax(0,1fr)`, disabled input, empty state) and a fixed-width (`360px`) Verification Audit Log pane. Both panes remain structural placeholders anticipating the `POST /api/v1/query/stream` SSE contract (`event: token` / `event: verification` / `event: done`, per Module 4) without consuming it — no streaming wiring exists yet.
+
+**API client — `src/lib/api.ts` (Module 5)**
+- A native `fetch` wrapper over `process.env.NEXT_PUBLIC_API_URL` (set to `http://127.0.0.1:8000/api/v1` in `frontend/.env.local` — the base already carries the `/api/v1` prefix, so route paths are appended bare as `/workspaces`).
+- Exposes `getWorkspaces(): Promise<Workspace[]>` and `createWorkspace(name: string): Promise<Workspace>`, both typed against `src/types/index.ts`.
+- `ApiError extends Error` carries the HTTP `status`, with `status === 0` reserved for requests that never reached the server (transport failure or a CORS rejection) — letting the UI distinguish "backend said no" from "backend unreachable".
+- The response body is read **once as text** and then parsed, rather than calling `response.json()` directly: a non-JSON error payload (an HTML 404 page, a proxy 502) would otherwise throw an opaque parse error that masks the real status. `extractDetail()` normalizes both FastAPI error shapes — `{"detail": "..."}` from explicit `HTTPException`s, and `{"detail": [{"msg": ...}]}` from Pydantic 422 validation failures.
+
+**Workspace state — `src/context/WorkspaceContext.tsx` (Module 5)**
+- `WorkspaceProvider` holds `workspaces`, `activeWorkspace`, `isLoading`, and `error`, exposing `fetchWorkspaces`, `addWorkspace`, and `setActiveWorkspace`; `useWorkspaces()` throws if consumed outside the provider, so a missing wrapper fails loudly at the call site rather than silently yielding `null` state.
+- `addWorkspace` resolves to `Workspace | null` instead of throwing: the backend's `409` on a duplicate name is an expected outcome of normal user input, so it becomes rendered `error` state rather than an unhandled promise rejection at the click handler.
+- `fetchWorkspaces` clears `activeWorkspace` when the selected workspace is absent from the refreshed list, preventing a stale selection from outliving a server-side deletion.
+- Mounted in `src/app/layout.tsx` around both the `Sidebar` and the routed `children`, so the sidebar list and the page header read the same selection. The layout itself stays a Server Component — only the provider subtree is client-side.
 
 **Type contracts — `src/types/index.ts`**
 
@@ -137,16 +150,17 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - `VerificationResult` / `ClaimVerification` ← `app/services/nli_verifier.py` dataclasses — field-for-field, including `EntailmentLabel` as the `"entailed" | "not_entailed" | "insufficient_evidence"` string union matching the Python `Enum`'s values.
 
 **Current state**
-- Purely structural: no `fetch`/`EventSource` calls exist anywhere in `frontend/src/` yet. `tsc --noEmit`, `eslint .`, and `next build` (Turbopack) all pass clean with zero warnings.
-- Next integration pass: `Sidebar` → `GET /api/v1/workspaces`; dashboard query input → `POST /api/v1/query/stream`, consuming its SSE events into the Chat/Query and Verification Audit Log panes.
+- Workspace management (Module 5) is wired end-to-end: list, create, select, and active-workspace display all call the live backend. Document upload and query streaming remain unwired.
+- `tsc --noEmit`, `eslint .`, and `next build` (Turbopack) all pass clean with zero warnings.
+- The browser must reach the app at `http://localhost:3000`, not `http://127.0.0.1:3000` — `settings.cors_allowed_origins` defaults to the former only, and the two are distinct origins to the browser's CORS check.
+- Next integration pass: document upload (Module 6), then the query input → `POST /api/v1/query/stream` (Module 7), consuming its SSE events into the Chat/Query and Verification Audit Log panes.
 
 ### Frontend Execution Roadmap (Planned)
 
-**Module 5 — Workspace Architecture**
-- `src/lib/api/workspaces.ts`: typed fetch wrappers — `listWorkspaces(): Promise<Workspace[]>` (`GET /api/v1/workspaces`) and `createWorkspace(name: string): Promise<Workspace>` (`POST /api/v1/workspaces`), surfacing the backend's `409` on duplicate names as a typed error rather than a generic throw.
-- **Backend prerequisite:** `GET /api/v1/workspaces` does not exist yet — `app/api/endpoints/workspaces.py` (Module 4) currently implements only `POST`. Adding the list endpoint blocks this module.
-- Active-workspace state: a minimal `WorkspaceProvider` context (or URL-driven `?workspace=<id>` state — exact mechanism TBD at implementation time) replacing `Sidebar`'s current static placeholder array and empty state.
-- `Sidebar` wired to `listWorkspaces()` on mount, with the "New Workspace" button opening a form that calls `createWorkspace()` and re-fetches (or optimistically updates) the list.
+**Module 5 — Workspace Architecture — ✅ Implemented**
+- Shipped as `src/lib/api.ts` (a single flat module rather than the planned `src/lib/api/workspaces.ts`, since two endpoints did not warrant a directory) plus `src/context/WorkspaceContext.tsx` — both documented under "Frontend Architecture (As-Built)" above.
+- The planned backend prerequisite is resolved: `GET /api/v1/workspaces` was added to `app/api/endpoints/workspaces.py` as part of this module.
+- Deferred from this pass: the "New Workspace" flow uses `window.prompt` rather than an in-app form, and the new `GET` route has no committed regression tests (it was verified ad-hoc against the in-memory SQLite fixtures).
 
 **Module 6 — Document Ingestion UI**
 - Upload surface (drag-and-drop + file picker) posting `multipart/form-data` to `POST /api/v1/documents/upload` (`workspace_id` + one or more files), matching `app/api/endpoints/documents.py`'s existing contract.

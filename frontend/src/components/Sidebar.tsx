@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   FolderKanban,
   Layers,
@@ -10,13 +10,31 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { Workspace } from "@/types";
-
-// Static placeholder until the workspaces API is wired up.
-const PLACEHOLDER_WORKSPACES: Workspace[] = [];
+import { useWorkspaces } from "@/context/WorkspaceContext";
 
 export function Sidebar() {
   const [collapsed, setCollapsed] = useState(false);
+  const {
+    workspaces,
+    activeWorkspace,
+    isLoading,
+    error,
+    fetchWorkspaces,
+    addWorkspace,
+    setActiveWorkspace,
+  } = useWorkspaces();
+
+  useEffect(() => {
+    void fetchWorkspaces();
+  }, [fetchWorkspaces]);
+
+  async function handleCreateWorkspace() {
+    const name = window.prompt("Name your new workspace:")?.trim();
+    if (!name) {
+      return;
+    }
+    await addWorkspace(name);
+  }
 
   return (
     <aside
@@ -54,6 +72,8 @@ export function Sidebar() {
       <div className="flex flex-1 flex-col gap-1 overflow-y-auto p-3">
         <button
           type="button"
+          onClick={handleCreateWorkspace}
+          title={collapsed ? "New Workspace" : undefined}
           className={cn(
             "flex items-center gap-2 rounded-md border border-dashed border-zinc-700 px-3 py-2 text-sm font-medium text-zinc-300 transition-colors hover:border-indigo-500 hover:bg-indigo-500/10 hover:text-indigo-300",
             collapsed && "justify-center px-0"
@@ -75,30 +95,61 @@ export function Sidebar() {
           </div>
 
           <div className="mt-2 flex flex-col gap-0.5">
-            {PLACEHOLDER_WORKSPACES.length === 0 ? (
-              !collapsed && (
-                <p className="px-2 py-1.5 text-sm text-zinc-600">
-                  No workspaces yet.
-                </p>
-              )
-            ) : (
+            {isLoading && !collapsed && (
+              <p className="px-2 py-1.5 text-sm text-zinc-600">Loading…</p>
+            )}
+
+            {!isLoading && error && !collapsed && (
+              <div className="px-2 py-1.5">
+                <p className="text-sm text-red-400">{error}</p>
+                <button
+                  type="button"
+                  onClick={() => void fetchWorkspaces()}
+                  className="mt-1 text-xs font-medium text-indigo-400 transition-colors hover:text-indigo-300"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+
+            {!isLoading && !error && workspaces.length === 0 && !collapsed && (
+              <p className="px-2 py-1.5 text-sm text-zinc-600">
+                No workspaces yet.
+              </p>
+            )}
+
+            {workspaces.length > 0 && (
               <ul className="flex flex-col gap-0.5">
-                {PLACEHOLDER_WORKSPACES.map((workspace) => (
-                  <li key={workspace.id}>
-                    <button
-                      type="button"
-                      className={cn(
-                        "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-zinc-300 transition-colors hover:bg-zinc-900 hover:text-zinc-100",
-                        collapsed && "justify-center px-0"
-                      )}
-                    >
-                      <FolderKanban className="h-4 w-4 shrink-0 text-zinc-500" />
-                      {!collapsed && (
-                        <span className="truncate">{workspace.name}</span>
-                      )}
-                    </button>
-                  </li>
-                ))}
+                {workspaces.map((workspace) => {
+                  const isActive = activeWorkspace?.id === workspace.id;
+                  return (
+                    <li key={workspace.id}>
+                      <button
+                        type="button"
+                        onClick={() => setActiveWorkspace(workspace)}
+                        title={collapsed ? workspace.name : undefined}
+                        aria-current={isActive ? "true" : undefined}
+                        className={cn(
+                          "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors",
+                          isActive
+                            ? "bg-indigo-500/10 text-indigo-300 ring-1 ring-inset ring-indigo-500/30"
+                            : "text-zinc-300 hover:bg-zinc-900 hover:text-zinc-100",
+                          collapsed && "justify-center px-0"
+                        )}
+                      >
+                        <FolderKanban
+                          className={cn(
+                            "h-4 w-4 shrink-0",
+                            isActive ? "text-indigo-400" : "text-zinc-500"
+                          )}
+                        />
+                        {!collapsed && (
+                          <span className="truncate">{workspace.name}</span>
+                        )}
+                      </button>
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </div>

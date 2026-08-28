@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -7,6 +8,13 @@ from app.models import Workspace
 from app.schemas.workspace import WorkspaceCreate, WorkspaceRead
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["workspaces"])
+
+
+@router.get("", response_model=list[WorkspaceRead])
+async def list_workspaces(session: AsyncSession = Depends(get_db)) -> list[Workspace]:
+    """Returns every workspace, newest first."""
+    result = await session.execute(select(Workspace).order_by(Workspace.created_at.desc()))
+    return list(result.scalars().all())
 
 
 @router.post("", response_model=WorkspaceRead, status_code=status.HTTP_201_CREATED)

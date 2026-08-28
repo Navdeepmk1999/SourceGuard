@@ -1,3 +1,11 @@
 backend/venv/
 backend/__pycache__/
 backend/.pytest_cache/
+
+# graphify: graph.json is tracked (it has a merge driver in .gitattributes);
+# the rendered viz, extraction cache, and interpreter sidecars are local artifacts.
+graphify-out/graph.html
+graphify-out/cache/
+graphify-out/cost.json
+graphify-out/.graphify_*
+backend/.env
