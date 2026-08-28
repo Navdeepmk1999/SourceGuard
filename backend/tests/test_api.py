@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -7,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.api.deps import get_hybrid_retriever
 from app.db.session import get_db
 from app.main import app
-from app.models import Base, Document, DocumentChunk
+from app.models import Base, Document, DocumentChunk, Workspace
 
 
 class _StubRetriever:
@@ -66,6 +67,48 @@ class TestWorkspaceCreation:
         await client.post("/api/v1/workspaces", json={"name": "Duplicate Co"})
         response = await client.post("/api/v1/workspaces", json={"name": "Duplicate Co"})
         assert response.status_code == 409
+
+
+class TestWorkspaceListing:
+    async def test_list_workspaces_returns_empty_list(self, client):
+        response = await client.get("/api/v1/workspaces")
+        assert response.status_code == 200
+        assert response.json() == []
+
+    async def test_list_workspaces_orders_newest_first(self, client, session_maker):
+        # Inserted directly with explicit timestamps: server_default=func.now() has
+        # only second-level resolution on SQLite, so three rapid API-created rows
+        # would tie and make ordering unverifiable.
+        async with session_maker() as session:
+            base = datetime(2024, 1, 1, tzinfo=UTC)
+            session.add_all(
+                [
+                    Workspace(name="Oldest Co", created_at=base),
+                    Workspace(name="Middle Co", created_at=base + timedelta(hours=1)),
+                    Workspace(name="Newest Co", created_at=base + timedelta(hours=2)),
+                ]
+            )
+            await session.commit()
+
+        response = await client.get("/api/v1/workspaces")
+        assert response.status_code == 200
+        names = [workspace["name"] for workspace in response.json()]
+        assert names == ["Newest Co", "Middle Co", "Oldest Co"]
+
+    async def test_list_workspaces_returns_workspace_read_shape(self, client):
+        created = await client.post("/api/v1/workspaces", json={"name": "Shape Co"})
+        created_body = created.json()
+
+        response = await client.get("/api/v1/workspaces")
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body) == 1
+        workspace = body[0]
+        assert set(workspace.keys()) == {"id", "name", "created_at"}
+        assert workspace["id"] == created_body["id"]
+        assert workspace["name"] == "Shape Co"
+        assert uuid.UUID(workspace["id"])
+        assert "created_at" in workspace
 
 
 class TestDocumentUpload:
