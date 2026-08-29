@@ -162,10 +162,11 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - The planned backend prerequisite is resolved: `GET /api/v1/workspaces` was added to `app/api/endpoints/workspaces.py` as part of this module.
 - Deferred from this pass: the "New Workspace" flow uses `window.prompt` rather than an in-app form, and the new `GET` route has no committed regression tests (it was verified ad-hoc against the in-memory SQLite fixtures).
 
-**Module 6 — Document Ingestion UI**
-- Upload surface (drag-and-drop + file picker) posting `multipart/form-data` to `POST /api/v1/documents/upload` (`workspace_id` + one or more files), matching `app/api/endpoints/documents.py`'s existing contract.
-- Client-side error handling keyed to the backend's existing strict validation: `400` for disallowed extensions or path-traversal/disguised-extension filenames (`DocumentParser._validate_filename`), `404` for an unknown `workspace_id`, `422` for decode failures — each rendered as a distinct, actionable inline error rather than a generic failure toast, since the backend already fails fast and specifically per file.
-- Per-file upload status list (`pending` / `uploading` / `parsed` / `rejected`) reflecting the backend's fail-fast batch behavior: one invalid file rejects the entire multi-file request, so the UI must communicate that a batch either fully succeeds or is fully rejected — never partial success.
+**Document Upload — `src/components/DocumentUpload.tsx` (Module 6)**
+- Replaces the dashboard header placeholder with a live, context-aware upload button. Disables automatically if `activeWorkspace` is null or if an upload is currently in flight.
+- Uses a hidden `<input type="file" accept=".pdf,.txt" />` triggered via a styled `<button>` to enforce allowed extensions natively at the OS file-picker level.
+- Incorporates a lightweight, custom toast notification system to display success states or explicitly surface the backend's 400/422 rejection details (e.g., path traversal attempts, unsupported files) without adding third-party dependencies.
+- `src/lib/api.ts` was updated to omit the `Content-Type: application/json` header when the body is `FormData`, allowing the browser to correctly set the multipart boundary.
 
 **Module 7 — Streaming Interface & Real-Time Audit**
 - Chat input wired to `POST /api/v1/query/stream` (`app/api/endpoints/query.py`). Since the native `EventSource` API only supports `GET`, this requires a `fetch` + `ReadableStream` SSE parser (manual `event:`/`data:` frame parsing) rather than `new EventSource(url)` — a real constraint worth fixing in the plan now, not discovering during implementation.
