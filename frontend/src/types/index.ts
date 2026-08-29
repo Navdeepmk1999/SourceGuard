@@ -26,6 +26,20 @@ export interface DocumentChunk {
   created_at: string;
 }
 
+// Mirrors backend/app/schemas/document.py::DocumentIngestSummary / DocumentUploadResponse.
+export interface DocumentIngestSummary {
+  document_id: string;
+  filename: string;
+  document_type: DocumentType;
+  total_pages: number | null;
+  total_chunks: number;
+}
+
+export interface DocumentUploadResponse {
+  workspace_id: string;
+  documents: DocumentIngestSummary[];
+}
+
 export type EntailmentLabel =
   | "entailed"
   | "not_entailed"
