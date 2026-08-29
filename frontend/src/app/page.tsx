@@ -1,6 +1,7 @@
 "use client";
 
 import { FileSearch, MessageSquare, Search, ShieldCheck } from "lucide-react";
+import { DocumentUpload } from "@/components/DocumentUpload";
 import { useWorkspaces } from "@/context/WorkspaceContext";
 
 export default function Home() {
@@ -17,12 +18,7 @@ export default function Home() {
             {activeWorkspace ? "Active workspace" : "No workspace selected"}
           </p>
         </div>
-        <button
-          type="button"
-          className="rounded-md bg-indigo-500 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-indigo-400"
-        >
-          Upload Document
-        </button>
+        <DocumentUpload />
       </header>
 
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px]">

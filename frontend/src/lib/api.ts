@@ -1,4 +1,4 @@
-import type { Workspace } from "@/types";
+import type { DocumentUploadResponse, Workspace } from "@/types";
 
 // Already includes the `/api/v1` prefix (see frontend/.env.local), so route
 // paths below are appended bare: `/workspaces` -> `<base>/api/v1/workspaces`.
@@ -56,14 +56,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     );
   }
 
+  // A FormData body must NOT get an explicit Content-Type: fetch has to set
+  // it itself so the multipart boundary is included.
+  const isFormData = init?.body instanceof FormData;
+
   let response: Response;
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
       ...init,
-      headers: {
-        "Content-Type": "application/json",
-        ...init?.headers,
-      },
+      headers: isFormData
+        ? init?.headers
+        : { "Content-Type": "application/json", ...init?.headers },
     });
   } catch (cause) {
     throw new ApiError(
@@ -109,5 +112,26 @@ export function createWorkspace(name: string): Promise<Workspace> {
   return request<Workspace>("/workspaces", {
     method: "POST",
     body: JSON.stringify({ name }),
+  });
+}
+
+/**
+ * Uploads a single file to a workspace. Rejects with `ApiError(400)` for a
+ * disallowed extension or a path-traversal/disguised-extension filename
+ * (`DocumentParser._validate_filename`), `ApiError(404)` for an unknown
+ * `workspaceId`, or `ApiError(422)` for a decode failure — each carrying the
+ * backend's exact rejection detail as its message.
+ */
+export function uploadDocument(
+  workspaceId: string,
+  file: File
+): Promise<DocumentUploadResponse> {
+  const formData = new FormData();
+  formData.append("workspace_id", workspaceId);
+  formData.append("files", file);
+
+  return request<DocumentUploadResponse>("/documents/upload", {
+    method: "POST",
+    body: formData,
   });
 }
