@@ -56,3 +56,10 @@
 - Closed the outstanding gap from the previous entry: added `TestWorkspaceListing` to `tests/test_api.py`, covering the empty-list case, newest-first ordering, and the exact `WorkspaceRead` response shape (`id`/`name`/`created_at` keys only).
 - The ordering test inserts `Workspace` rows directly via the session with explicit `created_at` timestamps rather than through the API: SQLite's `func.now()` server default only has second-level resolution, so three rapid API-created rows would tie and make ordering unverifiable.
 - Achieved 100% pass rate across 3 new tests — 61 tests passing overall.
+
+## Day 6 - Module 6 Document Ingestion UI
+- Implemented `uploadDocument` in `src/lib/api.ts` to handle `multipart/form-data` POST requests to `/api/v1/documents/upload`. Updated the core `request()` utility to dynamically bypass the `application/json` Content-Type header when sending files, allowing the browser to properly set the multipart boundary.
+- Built a secure `<DocumentUpload />` client component utilizing a hidden HTML file input strictly restricted to `accept=".pdf,.txt"` to enforce file types at the OS-level before upload.
+- Implemented a lightweight, custom React state-based toast notification system to elegantly surface exact backend error strings (HTTP 400/422) without relying on heavy third-party libraries.
+- Replaced the static placeholder button in `src/app/page.tsx` with the context-aware upload component that disables itself when no workspace is active.
+- Cleaned up Git tracking to exclude macOS `.DS_Store` and Python `__pycache__` artifacts.
