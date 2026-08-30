@@ -63,3 +63,10 @@
 - Implemented a lightweight, custom React state-based toast notification system to elegantly surface exact backend error strings (HTTP 400/422) without relying on heavy third-party libraries.
 - Replaced the static placeholder button in `src/app/page.tsx` with the context-aware upload component that disables itself when no workspace is active.
 - Cleaned up Git tracking to exclude macOS `.DS_Store` and Python `__pycache__` artifacts.
+
+## Day 7 - Module 7 Streaming Interface & Real-Time Audit
+- Implemented `streamQuery` in `src/lib/api.ts` as an async generator that manually parses Server-Sent Events (SSE) from the `POST /api/v1/query/stream` endpoint using `response.body.getReader()`.
+- Built a robust React state machine in `src/app/page.tsx` to handle the four event types (`token`, `verification`, `done`, `error`) and drive the UI updates in real-time.
+- Wired the Chat input form to trigger the stream, rendering tokens sequentially in the main content pane.
+- Implemented the Verification Audit Log to dynamically render and color-code `ClaimVerification` objects (emerald, amber, red) as they arrive from the verifier.
+- Handled a backend contract discrepancy by gracefully omitting `supporting_chunk_index` links from the UI, ensuring resilience against missing JSON payload fields.

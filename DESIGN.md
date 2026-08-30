@@ -168,7 +168,9 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - Incorporates a lightweight, custom toast notification system to display success states or explicitly surface the backend's 400/422 rejection details (e.g., path traversal attempts, unsupported files) without adding third-party dependencies.
 - `src/lib/api.ts` was updated to omit the `Content-Type: application/json` header when the body is `FormData`, allowing the browser to correctly set the multipart boundary.
 
-**Module 7 — Streaming Interface & Real-Time Audit**
-- Chat input wired to `POST /api/v1/query/stream` (`app/api/endpoints/query.py`). Since the native `EventSource` API only supports `GET`, this requires a `fetch` + `ReadableStream` SSE parser (manual `event:`/`data:` frame parsing) rather than `new EventSource(url)` — a real constraint worth fixing in the plan now, not discovering during implementation.
-- Stream handling matches Module 4's four emitted event types exactly: `event: token` (append to the in-progress answer in the Chat/Query pane), `event: verification` (push a `ClaimVerification` row into the Verification Audit Log pane as it arrives — the "real-time" part), `event: done` (finalize the answer text, `overall_score`, `is_fully_supported`), `event: error` (empty-retrieved-context case).
-- Audit Log entries color-coded by `EntailmentLabel` (`entailed` / `not_entailed` / `insufficient_evidence`, per `src/types/index.ts`), each linking back to its `supporting_chunk_index` so a claim can be traced to the exact source chunk that grounded it.
+**Streaming Chat & Audit Log — `src/app/page.tsx` (Module 7)**
+- Consumes `POST /api/v1/query/stream` via a custom async generator (`streamQuery` in `api.ts`) that reads the `ReadableStream` and parses `\r\n`-terminated SSE frames natively, bypassing the GET-only limitations of the browser's `EventSource`.
+- Real-time state machine accumulates `event: token` frames into the live answer block, and pushes `event: verification` frames into a dedicated Audit Log array.
+- Claims in the Audit Log are visually color-coded using `cn()` and Tailwind based on their `EntailmentLabel` (emerald for entailed, amber for insufficient, red for not_entailed).
+- Fails safely: handles pre-stream API errors (e.g., 404 for an invalid workspace) and gracefully ignores missing optional fields (like `supporting_chunk_index`) from the backend payload.
+
