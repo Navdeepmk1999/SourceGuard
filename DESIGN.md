@@ -154,7 +154,7 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - Workspace management (Module 5), document upload (Module 6), streaming query + verification (Module 7), and the workspace documents view (Module 8) are all wired end-to-end against the live backend. No frontend surface remains a structural-only placeholder.
 - `tsc --noEmit`, `eslint .`, and `next build` (Turbopack) all pass clean with zero warnings.
 - The browser must reach the app at `http://localhost:3000`, not `http://127.0.0.1:3000` — `settings.cors_allowed_origins` defaults to the former only, and the two are distinct origins to the browser's CORS check.
-- Outstanding from earlier modules: the "New Workspace" flow still uses `window.prompt` rather than an in-app form (Module 5), and no regression tests are committed yet for `GET /workspaces` (Module 5) or `GET /workspaces/{workspace_id}/documents` (Module 8) — both were verified ad-hoc / via manual integration runs rather than a committed pytest suite.
+- Outstanding from earlier modules: the "New Workspace" flow still uses `window.prompt` rather than an in-app form (Module 5). `GET /workspaces` (Module 5, `TestWorkspaceListing`) and `GET /workspaces/{workspace_id}/documents` (Module 8, `TestWorkspaceDocuments`) both have committed regression tests in `tests/test_api.py` — 65 backend tests passing overall.
 
 ### Frontend Execution Roadmap
 
@@ -180,5 +180,5 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - Frontend: `getWorkspaceDocuments(workspaceId)` added to `api.ts`, typed against the new `WorkspaceDocument` interface — deliberately not `Document[]`, since the wire shape differs (no `workspace_id`, plus the computed `total_chunks`).
 - `WorkspaceDocuments` is a new, self-contained Client Component (mirroring `DocumentUpload`'s file-per-concern granularity) that fetches on mount and on `workspaceId` change, using a `cancelled`-flag effect to avoid a race when the active workspace changes mid-fetch. Renders loading / error / empty / populated states; each populated row shows the filename (with a `lucide-react` `FileText` icon, truncated with a `title` tooltip) and its chunk count.
 - Nested inside `Sidebar.tsx`'s active workspace `<li>`, shown only when that workspace is both selected and the sidebar is expanded (`!collapsed`) — collapsed icon-only mode has no room for filenames.
-- No committed regression tests for the new route (see "Current state" above); verified via a direct SQLite-backed integration run (empty case, populated case with mixed chunk counts, and the 404 case) and, on the frontend side, by exercising the real `getWorkspaceDocuments` export against a live instance of the actual backend.
+- `TestWorkspaceDocuments` in `tests/test_api.py` covers the 404 case, the empty-list case, newest-first ordering, and the `DocumentRead` shape with correct `total_chunks` aggregation. Also verified via a direct SQLite-backed integration run and, on the frontend side, by exercising the real `getWorkspaceDocuments` export against a live instance of the actual backend.
 

@@ -111,6 +111,89 @@ class TestWorkspaceListing:
         assert "created_at" in workspace
 
 
+class TestWorkspaceDocuments:
+    async def test_list_documents_unknown_workspace_returns_404(self, client):
+        response = await client.get(f"/api/v1/workspaces/{uuid.uuid4()}/documents")
+        assert response.status_code == 404
+
+    async def test_list_documents_returns_empty_list(self, client):
+        ws_resp = await client.post("/api/v1/workspaces", json={"name": "Empty Docs Co"})
+        workspace_id = ws_resp.json()["id"]
+
+        response = await client.get(f"/api/v1/workspaces/{workspace_id}/documents")
+        assert response.status_code == 200
+        assert response.json() == []
+
+    async def test_list_documents_orders_newest_first(self, client, session_maker):
+        ws_resp = await client.post("/api/v1/workspaces", json={"name": "Ordered Docs Co"})
+        workspace_id = uuid.UUID(ws_resp.json()["id"])
+
+        # Inserted directly with explicit timestamps: server_default=func.now() has
+        # only second-level resolution on SQLite, so three rapid inserts would tie.
+        async with session_maker() as session:
+            base = datetime(2024, 1, 1, tzinfo=UTC)
+            session.add_all(
+                [
+                    Document(
+                        workspace_id=workspace_id, filename="oldest.txt",
+                        document_type="txt", created_at=base,
+                    ),
+                    Document(
+                        workspace_id=workspace_id, filename="middle.txt",
+                        document_type="txt", created_at=base + timedelta(hours=1),
+                    ),
+                    Document(
+                        workspace_id=workspace_id, filename="newest.txt",
+                        document_type="txt", created_at=base + timedelta(hours=2),
+                    ),
+                ]
+            )
+            await session.commit()
+
+        response = await client.get(f"/api/v1/workspaces/{workspace_id}/documents")
+        assert response.status_code == 200
+        filenames = [doc["filename"] for doc in response.json()]
+        assert filenames == ["newest.txt", "middle.txt", "oldest.txt"]
+
+    async def test_list_documents_returns_document_read_shape_with_chunk_counts(
+        self, client, session_maker
+    ):
+        ws_resp = await client.post("/api/v1/workspaces", json={"name": "Shaped Docs Co"})
+        workspace_id = uuid.UUID(ws_resp.json()["id"])
+
+        async with session_maker() as session:
+            with_chunks = Document(
+                workspace_id=workspace_id, filename="report.pdf", document_type="pdf"
+            )
+            without_chunks = Document(
+                workspace_id=workspace_id, filename="empty.txt", document_type="txt"
+            )
+            session.add_all([with_chunks, without_chunks])
+            await session.flush()
+            session.add_all(
+                [
+                    DocumentChunk(document_id=with_chunks.id, content="first chunk", chunk_index=0),
+                    DocumentChunk(document_id=with_chunks.id, content="second chunk", chunk_index=1),
+                ]
+            )
+            await session.commit()
+
+        response = await client.get(f"/api/v1/workspaces/{workspace_id}/documents")
+        assert response.status_code == 200
+        body = response.json()
+        by_filename = {doc["filename"]: doc for doc in body}
+
+        report = by_filename["report.pdf"]
+        assert set(report.keys()) == {"id", "filename", "document_type", "created_at", "total_chunks"}
+        assert uuid.UUID(report["id"])
+        assert report["document_type"] == "pdf"
+        assert report["total_chunks"] == 2
+
+        empty = by_filename["empty.txt"]
+        assert empty["document_type"] == "txt"
+        assert empty["total_chunks"] == 0
+
+
 class TestDocumentUpload:
     async def test_upload_txt_document_succeeds(self, client):
         ws_resp = await client.post("/api/v1/workspaces", json={"name": "Upload Co"})
