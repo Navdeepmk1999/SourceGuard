@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # AI providers
     groq_api_key: str = ""
     groq_api_base: str = "https://api.groq.com/openai/v1"
-    groq_model: str = "llama-3.1-8b-instant"
+    groq_model: str = "openai/gpt-oss-20b"
     together_api_key: str = ""
     together_api_base: str = "https://api.together.xyz/v1"
     embedding_model: str = "togethercomputer/m2-bert-80M-32k-retrieval"

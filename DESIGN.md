@@ -91,6 +91,7 @@ The column type that lets `DocumentChunk.embedding` be a genuine `pgvector` colu
 **Workspaces — `app/api/endpoints/workspaces.py`**
 - `POST /api/v1/workspaces` creates a `Workspace`; a duplicate name raises `IntegrityError`, which is caught and converted to `HTTPException(409)`.
 - `GET /api/v1/workspaces` (added in Module 5) lists every workspace newest-first via `select(Workspace).order_by(Workspace.created_at.desc())`, returning `list[WorkspaceRead]`. Both routes are registered on the path `""` rather than `"/"`: since the router already carries the `/api/v1/workspaces` prefix, `"/"` would resolve to `/api/v1/workspaces/` and trigger a FastAPI `307` redirect for the un-slashed URL the frontend requests — an extra hop that also interacts badly with the strict CORS allow-list.
+- `GET /api/v1/workspaces/{workspace_id}/documents` (added in Module 8) returns every `Document` in a workspace, newest-first, each annotated with its `total_chunks` — a value not stored on the `Document` model, so it's computed per-request via `select(Document, func.count(DocumentChunk.id)).outerjoin(DocumentChunk, ...).group_by(Document.id)` rather than a stored column. A plain outerjoin + count + group-by (no Postgres-specific operators), so it runs unmodified against the in-memory SQLite test database as well as Postgres. `HTTPException(404)` if `workspace_id` doesn't exist. Returns `list[DocumentRead]` (`app/schemas/document.py`).
 
 **Document upload — `app/api/endpoints/documents.py`**
 - `POST /api/v1/documents/upload` accepts a `workspace_id` form field and one or more `UploadFile`s (`python-multipart`). Looks up the workspace first (`HTTPException(404)` if it doesn't exist), then per file: reads the raw bytes, calls `DocumentParser.parse()` — inheriting all of Module 1's path-traversal and extension validation for free — persists a `Document` row, batch-embeds every chunk's content via `EmbeddingService.embed_batch()` (Module 3), and inserts one `DocumentChunk` row per chunk with its embedding and metadata. Any single invalid file in a multi-file batch raises immediately (fail-fast `HTTPException`), so a request either fully succeeds or is rejected outright — never partially ingested.
@@ -126,12 +127,12 @@ The column type that lets `DocumentChunk.embedding` be a genuine `pgvector` colu
 
 **Structural layout**
 - `src/app/layout.tsx` (Root layout, Server Component): a fixed dark-mode-default shell — `zinc-950` background / `zinc-100` foreground applied directly, with no `prefers-color-scheme` branching or light theme. Renders the persistent `Sidebar` alongside a `min-w-0 flex-1` content region so routed pages fill the remaining width without overflow.
-- `src/components/Sidebar.tsx` (Client Component): toggles between a `w-64` expanded rail and a `w-16` icon-only collapsed rail. Consumes `WorkspaceContext` — fetches on mount, creates via `window.prompt` (a deliberate placeholder pending a real form), highlights the active workspace with `cn()`, and renders distinct loading / error-with-retry / empty (`No workspaces yet.`) states.
+- `src/components/Sidebar.tsx` (Client Component): toggles between a `w-64` expanded rail and a `w-16` icon-only collapsed rail. Consumes `WorkspaceContext` — fetches on mount, creates via `window.prompt` (a deliberate placeholder pending a real form), highlights the active workspace with `cn()`, and renders distinct loading / error-with-retry / empty (`No workspaces yet.`) states. Nests `src/components/WorkspaceDocuments.tsx` (Module 8) directly under the active workspace's list item — omitted entirely when the sidebar is collapsed, since filenames aren't legible in the icon-only rail.
 - `src/app/page.tsx` (Client Component — reads `activeWorkspace` from context for its header): the dashboard shell, split via CSS grid into two panes — a Chat/Query pane (`minmax(0,1fr)`, disabled input, empty state) and a fixed-width (`360px`) Verification Audit Log pane. Both panes remain structural placeholders anticipating the `POST /api/v1/query/stream` SSE contract (`event: token` / `event: verification` / `event: done`, per Module 4) without consuming it — no streaming wiring exists yet.
 
 **API client — `src/lib/api.ts` (Module 5)**
 - A native `fetch` wrapper over `process.env.NEXT_PUBLIC_API_URL` (set to `http://127.0.0.1:8000/api/v1` in `frontend/.env.local` — the base already carries the `/api/v1` prefix, so route paths are appended bare as `/workspaces`).
-- Exposes `getWorkspaces(): Promise<Workspace[]>` and `createWorkspace(name: string): Promise<Workspace>`, both typed against `src/types/index.ts`.
+- Exposes `getWorkspaces(): Promise<Workspace[]>` and `createWorkspace(name: string): Promise<Workspace>`, both typed against `src/types/index.ts`. Module 8 adds `getWorkspaceDocuments(workspaceId: string): Promise<WorkspaceDocument[]>` — `WorkspaceDocument` is a distinct type from `Document`, not a reuse of it: the endpoint's response has no `workspace_id` (already scoped by the URL) and adds a `total_chunks` field `Document` doesn't carry.
 - `ApiError extends Error` carries the HTTP `status`, with `status === 0` reserved for requests that never reached the server (transport failure or a CORS rejection) — letting the UI distinguish "backend said no" from "backend unreachable".
 - The response body is read **once as text** and then parsed, rather than calling `response.json()` directly: a non-JSON error payload (an HTML 404 page, a proxy 502) would otherwise throw an opaque parse error that masks the real status. `extractDetail()` normalizes both FastAPI error shapes — `{"detail": "..."}` from explicit `HTTPException`s, and `{"detail": [{"msg": ...}]}` from Pydantic 422 validation failures.
 
@@ -150,27 +151,34 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - `VerificationResult` / `ClaimVerification` ← `app/services/nli_verifier.py` dataclasses — field-for-field, including `EntailmentLabel` as the `"entailed" | "not_entailed" | "insufficient_evidence"` string union matching the Python `Enum`'s values.
 
 **Current state**
-- Workspace management (Module 5) is wired end-to-end: list, create, select, and active-workspace display all call the live backend. Document upload and query streaming remain unwired.
+- Workspace management (Module 5), document upload (Module 6), streaming query + verification (Module 7), and the workspace documents view (Module 8) are all wired end-to-end against the live backend. No frontend surface remains a structural-only placeholder.
 - `tsc --noEmit`, `eslint .`, and `next build` (Turbopack) all pass clean with zero warnings.
 - The browser must reach the app at `http://localhost:3000`, not `http://127.0.0.1:3000` — `settings.cors_allowed_origins` defaults to the former only, and the two are distinct origins to the browser's CORS check.
-- Next integration pass: document upload (Module 6), then the query input → `POST /api/v1/query/stream` (Module 7), consuming its SSE events into the Chat/Query and Verification Audit Log panes.
+- Outstanding from earlier modules: the "New Workspace" flow still uses `window.prompt` rather than an in-app form (Module 5), and no regression tests are committed yet for `GET /workspaces` (Module 5) or `GET /workspaces/{workspace_id}/documents` (Module 8) — both were verified ad-hoc / via manual integration runs rather than a committed pytest suite.
 
-### Frontend Execution Roadmap (Planned)
+### Frontend Execution Roadmap
 
 **Module 5 — Workspace Architecture — ✅ Implemented**
 - Shipped as `src/lib/api.ts` (a single flat module rather than the planned `src/lib/api/workspaces.ts`, since two endpoints did not warrant a directory) plus `src/context/WorkspaceContext.tsx` — both documented under "Frontend Architecture (As-Built)" above.
 - The planned backend prerequisite is resolved: `GET /api/v1/workspaces` was added to `app/api/endpoints/workspaces.py` as part of this module.
 - Deferred from this pass: the "New Workspace" flow uses `window.prompt` rather than an in-app form, and the new `GET` route has no committed regression tests (it was verified ad-hoc against the in-memory SQLite fixtures).
 
-**Document Upload — `src/components/DocumentUpload.tsx` (Module 6)**
+**Module 6 — Document Upload — `src/components/DocumentUpload.tsx` — ✅ Implemented**
 - Replaces the dashboard header placeholder with a live, context-aware upload button. Disables automatically if `activeWorkspace` is null or if an upload is currently in flight.
 - Uses a hidden `<input type="file" accept=".pdf,.txt" />` triggered via a styled `<button>` to enforce allowed extensions natively at the OS file-picker level.
 - Incorporates a lightweight, custom toast notification system to display success states or explicitly surface the backend's 400/422 rejection details (e.g., path traversal attempts, unsupported files) without adding third-party dependencies.
 - `src/lib/api.ts` was updated to omit the `Content-Type: application/json` header when the body is `FormData`, allowing the browser to correctly set the multipart boundary.
 
-**Streaming Chat & Audit Log — `src/app/page.tsx` (Module 7)**
+**Module 7 — Streaming Chat & Audit Log — `src/app/page.tsx` — ✅ Implemented**
 - Consumes `POST /api/v1/query/stream` via a custom async generator (`streamQuery` in `api.ts`) that reads the `ReadableStream` and parses `\r\n`-terminated SSE frames natively, bypassing the GET-only limitations of the browser's `EventSource`.
 - Real-time state machine accumulates `event: token` frames into the live answer block, and pushes `event: verification` frames into a dedicated Audit Log array.
 - Claims in the Audit Log are visually color-coded using `cn()` and Tailwind based on their `EntailmentLabel` (emerald for entailed, amber for insufficient, red for not_entailed).
 - Fails safely: handles pre-stream API errors (e.g., 404 for an invalid workspace) and gracefully ignores missing optional fields (like `supporting_chunk_index`) from the backend payload.
+
+**Module 8 — Workspace Documents View — `src/components/WorkspaceDocuments.tsx` — ✅ Implemented**
+- Backend: `GET /api/v1/workspaces/{workspace_id}/documents` added to `app/api/endpoints/workspaces.py`, returning `list[DocumentRead]` (`app/schemas/document.py`) — each entry carries a `total_chunks` count computed via an outerjoin + `func.count(...)` + `group_by(Document.id)`, portable across the SQLite test DB and Postgres. `HTTPException(404)` for an unknown workspace, matching the existing route's convention.
+- Frontend: `getWorkspaceDocuments(workspaceId)` added to `api.ts`, typed against the new `WorkspaceDocument` interface — deliberately not `Document[]`, since the wire shape differs (no `workspace_id`, plus the computed `total_chunks`).
+- `WorkspaceDocuments` is a new, self-contained Client Component (mirroring `DocumentUpload`'s file-per-concern granularity) that fetches on mount and on `workspaceId` change, using a `cancelled`-flag effect to avoid a race when the active workspace changes mid-fetch. Renders loading / error / empty / populated states; each populated row shows the filename (with a `lucide-react` `FileText` icon, truncated with a `title` tooltip) and its chunk count.
+- Nested inside `Sidebar.tsx`'s active workspace `<li>`, shown only when that workspace is both selected and the sidebar is expanded (`!collapsed`) — collapsed icon-only mode has no room for filenames.
+- No committed regression tests for the new route (see "Current state" above); verified via a direct SQLite-backed integration run (empty case, populated case with mixed chunk counts, and the 404 case) and, on the frontend side, by exercising the real `getWorkspaceDocuments` export against a live instance of the actual backend.
 

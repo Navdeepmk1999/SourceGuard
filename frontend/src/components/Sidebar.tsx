@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWorkspaces } from "@/context/WorkspaceContext";
+import { WorkspaceDocuments } from "@/components/WorkspaceDocuments";
 
 export function Sidebar() {
   const [collapsed, setCollapsed] = useState(false);
@@ -147,6 +148,9 @@ export function Sidebar() {
                           <span className="truncate">{workspace.name}</span>
                         )}
                       </button>
+                      {isActive && !collapsed && (
+                        <WorkspaceDocuments workspaceId={workspace.id} />
+                      )}
                     </li>
                   );
                 })}

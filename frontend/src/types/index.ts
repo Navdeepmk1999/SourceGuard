@@ -40,6 +40,17 @@ export interface DocumentUploadResponse {
   documents: DocumentIngestSummary[];
 }
 
+// Mirrors backend/app/schemas/document.py::DocumentRead. Not the same shape as
+// `Document` above (no `workspace_id` - already scoped by the request URL -
+// plus a computed `total_chunks` the ORM model doesn't carry as a column).
+export interface WorkspaceDocument {
+  id: string;
+  filename: string;
+  document_type: DocumentType;
+  created_at: string;
+  total_chunks: number;
+}
+
 export type EntailmentLabel =
   | "entailed"
   | "not_entailed"

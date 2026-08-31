@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DocumentType(str, Enum):
@@ -57,3 +57,20 @@ class DocumentUploadResponse(BaseModel):
 
     workspace_id: uuid.UUID
     documents: list[DocumentIngestSummary]
+
+
+class DocumentRead(BaseModel):
+    """A single document as returned by the workspace documents list endpoint.
+
+    `total_chunks` is not a column on the `Document` model - it is computed
+    (a per-document count of its `DocumentChunk` rows) by the endpoint's
+    query, not read directly off an ORM attribute.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    filename: str
+    document_type: DocumentType
+    created_at: datetime
+    total_chunks: int

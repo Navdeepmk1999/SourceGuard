@@ -3,6 +3,7 @@ import type {
   DocumentUploadResponse,
   EntailmentLabel,
   Workspace,
+  WorkspaceDocument,
 } from "@/types";
 
 // Already includes the `/api/v1` prefix (see frontend/.env.local), so route
@@ -138,6 +139,13 @@ export function uploadDocument(
   return request<DocumentUploadResponse>("/documents/upload", {
     method: "POST",
     body: formData,
+  });
+}
+
+/** Rejects with `ApiError(404)` for an unknown `workspaceId`. */
+export function getWorkspaceDocuments(workspaceId: string): Promise<WorkspaceDocument[]> {
+  return request<WorkspaceDocument[]>(`/workspaces/${workspaceId}/documents`, {
+    method: "GET",
   });
 }
 
