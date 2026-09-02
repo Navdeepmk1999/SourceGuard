@@ -26,7 +26,7 @@ async def async_session():
 
 class TestWorkspaceModel:
     async def test_create_workspace(self, async_session):
-        workspace = Workspace(name="Acme Corp")
+        workspace = Workspace(name="Acme Corp", user_id=uuid.uuid4())
         async_session.add(workspace)
         await async_session.commit()
 
@@ -34,17 +34,17 @@ class TestWorkspaceModel:
         assert workspace.created_at is not None
 
     async def test_workspace_name_must_be_unique(self, async_session):
-        async_session.add(Workspace(name="Acme Corp"))
+        async_session.add(Workspace(name="Acme Corp", user_id=uuid.uuid4()))
         await async_session.commit()
 
-        async_session.add(Workspace(name="Acme Corp"))
+        async_session.add(Workspace(name="Acme Corp", user_id=uuid.uuid4()))
         with pytest.raises(Exception):
             await async_session.commit()
 
 
 class TestWorkspaceDocumentChunkRelationships:
     async def test_workspace_to_document_to_chunk_relationship(self, async_session):
-        workspace = Workspace(name="Acme Corp")
+        workspace = Workspace(name="Acme Corp", user_id=uuid.uuid4())
         async_session.add(workspace)
         await async_session.flush()
 
@@ -74,7 +74,7 @@ class TestWorkspaceDocumentChunkRelationships:
         assert document.workspace.id == workspace.id
 
     async def test_cascade_delete_workspace_removes_documents_and_chunks(self, async_session):
-        workspace = Workspace(name="Cascade Co")
+        workspace = Workspace(name="Cascade Co", user_id=uuid.uuid4())
         async_session.add(workspace)
         await async_session.flush()
 
@@ -96,7 +96,7 @@ class TestWorkspaceDocumentChunkRelationships:
         assert (await async_session.get(DocumentChunk, chunk_id)) is None
 
     async def test_query_chunks_via_join(self, async_session):
-        workspace = Workspace(name="Query Co")
+        workspace = Workspace(name="Query Co", user_id=uuid.uuid4())
         async_session.add(workspace)
         await async_session.flush()
 

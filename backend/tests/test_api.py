@@ -5,10 +5,12 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.deps import get_hybrid_retriever
+from app.api.deps import get_current_user, get_hybrid_retriever
 from app.db.session import get_db
 from app.main import app
 from app.models import Base, Document, DocumentChunk, Workspace
+
+_TEST_USER_ID = uuid.uuid4()
 
 
 class _StubRetriever:
@@ -44,6 +46,9 @@ async def client(session_maker):
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
+    # Every route now requires auth (get_current_user, transitively via
+    # get_authenticated_db); this is the one place to stub it for every test.
+    app.dependency_overrides[get_current_user] = lambda: _TEST_USER_ID
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
@@ -83,9 +88,9 @@ class TestWorkspaceListing:
             base = datetime(2024, 1, 1, tzinfo=UTC)
             session.add_all(
                 [
-                    Workspace(name="Oldest Co", created_at=base),
-                    Workspace(name="Middle Co", created_at=base + timedelta(hours=1)),
-                    Workspace(name="Newest Co", created_at=base + timedelta(hours=2)),
+                    Workspace(name="Oldest Co", user_id=_TEST_USER_ID, created_at=base),
+                    Workspace(name="Middle Co", user_id=_TEST_USER_ID, created_at=base + timedelta(hours=1)),
+                    Workspace(name="Newest Co", user_id=_TEST_USER_ID, created_at=base + timedelta(hours=2)),
                 ]
             )
             await session.commit()

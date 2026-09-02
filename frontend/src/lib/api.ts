@@ -1,3 +1,4 @@
+import { createClient } from "@/lib/supabase/client";
 import type {
   ClaimVerification,
   DocumentUploadResponse,
@@ -9,6 +10,20 @@ import type {
 // Already includes the `/api/v1` prefix (see frontend/.env.local), so route
 // paths below are appended bare: `/workspaces` -> `<base>/api/v1/workspaces`.
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL;
+
+/**
+ * Fetches the active Supabase session and returns an `Authorization: Bearer
+ * <token>` header, or `{}` if there's no session - the backend's own
+ * `get_current_user` (app/api/deps.py) is what actually enforces auth; a
+ * missing header there is a normal 401, not something to special-case here.
+ */
+async function getAuthHeaders(): Promise<Record<string, string>> {
+  const supabase = createClient();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  return session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {};
+}
 
 /** `status === 0` means the request never reached the server (network/CORS). */
 export class ApiError extends Error {
@@ -65,14 +80,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // A FormData body must NOT get an explicit Content-Type: fetch has to set
   // it itself so the multipart boundary is included.
   const isFormData = init?.body instanceof FormData;
+  const authHeaders = await getAuthHeaders();
 
   let response: Response;
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
       ...init,
       headers: isFormData
-        ? init?.headers
-        : { "Content-Type": "application/json", ...init?.headers },
+        ? { ...authHeaders, ...init?.headers }
+        : { "Content-Type": "application/json", ...authHeaders, ...init?.headers },
     });
   } catch (cause) {
     throw new ApiError(
@@ -237,11 +253,13 @@ export async function* streamQuery(
     );
   }
 
+  const authHeaders = await getAuthHeaders();
+
   let response: Response;
   try {
     response = await fetch(`${API_BASE_URL}/query/stream`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders },
       body: JSON.stringify({ workspace_id: workspaceId, query }),
     });
   } catch (cause) {

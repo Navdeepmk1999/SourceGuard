@@ -3,7 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import get_db
+from app.api.deps import ensure_workspace_owner, get_authenticated_db, get_current_user
 from app.models import Document
 from app.models import DocumentChunk as DocumentChunkModel
 from app.models import Workspace
@@ -18,11 +18,11 @@ router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
 async def upload_documents(
     workspace_id: uuid.UUID = Form(...),
     files: list[UploadFile] = File(...),
-    session: AsyncSession = Depends(get_db),
+    session: AsyncSession = Depends(get_authenticated_db),
+    user_id: uuid.UUID = Depends(get_current_user),
 ) -> DocumentUploadResponse:
     workspace = await session.get(Workspace, workspace_id)
-    if workspace is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+    ensure_workspace_owner(workspace, user_id)
 
     parser = DocumentParser()
     embedding_service = EmbeddingService()

@@ -2,13 +2,12 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from app.api.deps import get_hybrid_retriever
-from app.db.session import get_db
+from app.api.deps import ensure_workspace_owner, get_authenticated_db, get_current_user, get_hybrid_retriever
 from app.models import DocumentChunk as DocumentChunkModel
 from app.models import Workspace
 from app.schemas.query import QueryRequest
@@ -83,11 +82,11 @@ async def _stream_query_events(
 @router.post("/stream")
 async def stream_query(
     payload: QueryRequest,
-    session: AsyncSession = Depends(get_db),
+    session: AsyncSession = Depends(get_authenticated_db),
+    user_id: uuid.UUID = Depends(get_current_user),
     retriever: HybridRetriever = Depends(get_hybrid_retriever),
 ) -> EventSourceResponse:
     workspace = await session.get(Workspace, payload.workspace_id)
-    if workspace is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+    ensure_workspace_owner(workspace, user_id)
 
     return EventSourceResponse(_stream_query_events(payload, session, retriever))

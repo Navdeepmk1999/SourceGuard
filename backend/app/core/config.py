@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     # CORS: origins allowed to call this API (comma-separated in .env)
     cors_allowed_origins: list[str] = ["http://localhost:3000"]
 
+    # Auth: verifies Supabase-issued JWTs via JWKS (see app/api/deps.py::
+    # get_current_user). This project's Supabase signing key is ES256/
+    # asymmetric (the newer JWT-signing-keys scheme), confirmed by reading
+    # `{supabase_url}/auth/v1/.well-known/jwks.json` directly - not the legacy
+    # HS256-shared-secret scheme, so no separate secret setting is needed here.
+    # Empty means unconfigured - get_current_user fails closed (HTTPException
+    # 500) rather than accepting unverifiable tokens.
+    supabase_url: str = ""
+
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
     def _split_comma_separated_origins(cls, value: object) -> object:

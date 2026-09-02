@@ -23,3 +23,6 @@ numpy
 # API & streaming gateway
 sse-starlette
 python-multipart
+
+# Auth (Supabase-issued JWT verification via JWKS - ES256, asymmetric)
+pyjwt[crypto]

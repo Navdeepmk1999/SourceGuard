@@ -1,20 +1,25 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   FolderKanban,
   Layers,
+  LogOut,
   Plus,
   PanelLeftClose,
   PanelLeftOpen,
   ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { createClient } from "@/lib/supabase/client";
 import { useWorkspaces } from "@/context/WorkspaceContext";
 import { WorkspaceDocuments } from "@/components/WorkspaceDocuments";
 
 export function Sidebar() {
+  const router = useRouter();
   const [collapsed, setCollapsed] = useState(false);
+  const [isSigningOut, setIsSigningOut] = useState(false);
   const {
     workspaces,
     activeWorkspace,
@@ -35,6 +40,18 @@ export function Sidebar() {
       return;
     }
     await addWorkspace(name);
+  }
+
+  async function handleSignOut() {
+    setIsSigningOut(true);
+    try {
+      const supabase = createClient();
+      await supabase.auth.signOut();
+      router.push("/login");
+      router.refresh();
+    } finally {
+      setIsSigningOut(false);
+    }
   }
 
   return (
@@ -158,6 +175,22 @@ export function Sidebar() {
             )}
           </div>
         </div>
+      </div>
+
+      <div className="border-t border-zinc-800 p-3">
+        <button
+          type="button"
+          onClick={() => void handleSignOut()}
+          disabled={isSigningOut}
+          title={collapsed ? "Sign Out" : undefined}
+          className={cn(
+            "flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-400 transition-colors hover:bg-red-500/10 hover:text-red-300 disabled:cursor-not-allowed disabled:opacity-50",
+            collapsed && "justify-center px-0"
+          )}
+        >
+          <LogOut className="h-4 w-4 shrink-0" />
+          {!collapsed && <span>{isSigningOut ? "Signing out…" : "Sign Out"}</span>}
+        </button>
       </div>
     </aside>
   );
