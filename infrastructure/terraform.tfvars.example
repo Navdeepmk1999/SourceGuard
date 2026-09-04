@@ -1,0 +1,29 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored -
+# it holds ARNs and origins specific to your account.
+
+aws_region  = "us-east-1"
+environment = "production"
+
+# Built from backend/Dockerfile and pushed to ECR. See DEPLOYMENT.md.
+container_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/sourceguard-backend:latest"
+
+# The Vercel deployment's origin. Must match exactly - the backend's CORS
+# policy is an explicit allow-list with no wildcards.
+cors_allowed_origins = "https://sourceguard.vercel.app"
+
+# Not a secret; used to build the JWKS endpoint for JWT verification.
+supabase_url = "https://<project-ref>.supabase.co"
+
+# Secrets are NOT set here. Store them in SSM Parameter Store as SecureString
+# (or Secrets Manager) and reference the ARNs, so values never enter
+# Terraform state, the task definition, or the console:
+#
+#   aws ssm put-parameter --name /sourceguard/DATABASE_URL \
+#     --type SecureString --value 'postgresql+asyncpg://...'
+secret_arns = {
+  DATABASE_URL      = "arn:aws:ssm:us-east-1:123456789012:parameter/sourceguard/DATABASE_URL"
+  REDIS_URL         = "arn:aws:ssm:us-east-1:123456789012:parameter/sourceguard/REDIS_URL"
+  GROQ_API_KEY      = "arn:aws:ssm:us-east-1:123456789012:parameter/sourceguard/GROQ_API_KEY"
+  TOGETHER_API_KEY  = "arn:aws:ssm:us-east-1:123456789012:parameter/sourceguard/TOGETHER_API_KEY"
+  LANGSMITH_API_KEY = "arn:aws:ssm:us-east-1:123456789012:parameter/sourceguard/LANGSMITH_API_KEY"
+}

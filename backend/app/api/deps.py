@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.db.session import get_db
+from app.db.session import TENANT_SETTING, get_db
 from app.models import Workspace
 from app.services.embeddings import EmbeddingService
 from app.services.retriever import HybridRetriever
@@ -103,13 +103,22 @@ async def get_authenticated_db(
 ) -> AsyncSession:
     """A `get_db`-shaped session with the RLS tenant context set.
 
-    Sets the Postgres session-local `app.current_user_id` variable via
-    `set_config(..., true)` - not a literal `SET LOCAL app.current_user_id =
-    ...` - since a bare `SET` statement can't take a bind parameter under
-    asyncpg's extended query protocol; `set_config` is a normal parameterized
-    function call and is the standard idiom for this exact multi-tenant RLS
-    pattern. The `workspace_isolation` policy on `workspaces` (see
-    app/db/init_db.py) then resolves to the caller's own rows.
+    Sets the Postgres `app.current_user_id` variable that the RLS policies in
+    app/db/init_db.py read, via `set_config` rather than a literal
+    `SET app.current_user_id = ...` - a bare `SET` can't take a bind
+    parameter under asyncpg's extended query protocol, whereas `set_config`
+    is an ordinary parameterized function call.
+
+    The third argument is `false` (session scope), NOT `true` (transaction
+    scope). Transaction scope looks more conservative and is actively wrong
+    here: several endpoints commit mid-request (`create_workspace` commits
+    then refreshes; `stream_query` saves the user turn, generates, then saves
+    the assistant turn), and a transaction-scoped setting is discarded at
+    each commit. Every query after the first commit would then run with no
+    tenant context and - under enforced RLS - correctly see nothing, breaking
+    the request. Session scope survives commits; `get_db` clears it on
+    teardown so a pooled connection never carries it into another user's
+    request.
 
     A no-op on non-Postgres dialects (e.g. the SQLite test engine), since
     neither RLS nor `set_config` exist there - mirrors `PortableVector`'s
@@ -117,8 +126,8 @@ async def get_authenticated_db(
     """
     if session.bind is not None and session.bind.dialect.name == "postgresql":
         await session.execute(
-            text("SELECT set_config('app.current_user_id', :user_id, true)"),
-            {"user_id": str(user_id)},
+            text("SELECT set_config(:name, :user_id, false)"),
+            {"name": TENANT_SETTING, "user_id": str(user_id)},
         )
     return session
 

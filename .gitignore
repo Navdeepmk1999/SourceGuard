@@ -13,3 +13,17 @@ backend/.env
 **/__pycache__/
 graphify-out/
 .env
+
+# Terraform. State is the critical one: it stores resolved secret values
+# (DATABASE_URL, API keys) in PLAINTEXT, so it must never be committed. Use
+# an encrypted remote backend for anything shared - see infrastructure/main.tf.
+# .terraform.lock.hcl is deliberately NOT ignored: it pins provider versions
+# and belongs in version control.
+infrastructure/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+# Real variable values (ARNs, origins); the .example file is tracked.
+terraform.tfvars
+*.auto.tfvars

@@ -199,7 +199,7 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - `TestQueryRateLimiting` in `tests/test_security.py` covers requests under the limit passing through to normal processing, the request that trips the threshold returning `429`, and that one user's exhausted budget doesn't affect another's - using an in-memory `_FakeRedis` that reimplements the Lua script's exact semantics, not a real Redis connection. This wasn't just convenience: the real async Redis client's connection pool binds to the event loop it was created in, and caching one client per URL (the same pattern used for `_get_jwk_client`) breaks across pytest-asyncio's per-test event loops with `RuntimeError: Event loop is closed` - `get_redis_client` needed to be overridable in tests for exactly this reason, independent of wanting to avoid a real Redis dependency in CI.
 - Verified directly against the real Redis container (`sourceguard-db`'s sibling `genegenius-redis`, already running locally) with the actual `_check_rate_limit`/`get_redis_client` functions, not a reimplementation: ten requests allowed, then denied, cleanly.
 - **Rate limiter fail-open:** `_check_rate_limit` catches `RedisError` and returns `True` (allow), logging at WARNING. Deliberate availability-over-enforcement tradeoff: without it a Redis outage 500s every rate-limited route, turning degraded protection into a total API outage. The cost is that Denial-of-Wallet protection is *disabled* during such an outage, so Redis availability is part of the cost-control story rather than an optional dependency. Covered by `test_rate_limiter_fails_open_when_redis_is_unavailable`, which drives a client whose `eval` raises `redis.exceptions.ConnectionError` (a `RedisError` - deliberately not Python's builtin `ConnectionError`, which is an `OSError` and would *not* be caught).
-- **⚠️ RLS IS CURRENTLY INERT IN THIS DEPLOYMENT.** The policies below are defined and correct, but the application connects to Postgres as the `postgres` role, which has both `rolsuper` and `rolbypassrls` - so **every RLS policy in this project is bypassed at runtime**, verified directly (`SELECT current_user, rolsuper, rolbypassrls`, and a live cross-user read that returned the other user's row). All actual tenant isolation today comes from the application layer - `ensure_workspace_owner()`, `list_workspaces`' `WHERE user_id` filter, and `get_or_create_session`'s ownership check - which is exactly why those are written as primary enforcement rather than defense-in-depth. Making RLS real requires connecting as a non-superuser role that owns no `BYPASSRLS` grant; that is an infrastructure change and has not been made.
+- **✅ RLS IS NOW ENFORCED** (closed after Module 12; see the "Row-Level Security enforcement" section below). It was previously inert: the app connected as `postgres`, which carries `rolsuper` and `rolbypassrls`, so every policy was bypassed at runtime. The application now connects as a restricted role and isolation is enforced by the database itself, verified by cross-tenant reads that return zero rows.
 - **Known gaps, still not addressed:** RLS (once actually enforcing, per the item above) covers `workspaces`, `chat_sessions`, and `chat_messages`, but not `documents`/`document_chunks`. `Workspace.name`'s uniqueness constraint is still global, not scoped per-user. The RLS policies and the `set_config` wiring in `get_authenticated_db` remain untestable in the pytest suite (SQLite has no RLS); only the SQLite-testable application-layer checks have committed coverage.
 
 **Module 10 — Contextual Intelligence & Conversation Memory — ✅ Implemented**
@@ -239,7 +239,7 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - **Dependencies:** none added. `requirements.txt` annotates why `pymupdf` now carries the layout role, and `README.md` documents that **no `poppler`/`tesseract` step exists** — so there is no fallback path to provide, which was the point of choosing this strategy.
 - **Tests:** `tests/test_ingestion.py` (23 tests) across layout classification, Markdown table fidelity, table-text de-duplication, list-welding, plain-text structure, and the three boundary rules — including that an oversized table stays whole, that splits land on element boundaries, and that offsets round-trip to the source. Full suite: **114 passing**.
 
-**Module 12 — DevOps & Cloud Orchestration — ✅ Containerization + CI Implemented (IaC and hybrid deployment still planned, see below)**
+**Module 12 — DevOps & Cloud Orchestration — ✅ Implemented (containerization, CI, and IaC)**
 - **`backend/Dockerfile`:** `python:3.11-slim`, `requirements.txt` copied and installed *before* application code so the dependency layer is keyed only on the lockfile — editing a source file rebuilds from the `COPY . .` step rather than reinstalling every package. Runs as a non-root `appuser` (uid 10001) created *after* the pip layer so user setup can't invalidate it. `HEALTHCHECK` hits the existing `/health` route through `urllib` rather than `curl`/`wget`, neither of which exists in `-slim` — adding one purely for a healthcheck would grow the image for nothing.
 - **`frontend/Dockerfile`:** three stages — `deps` (`npm ci`, keyed on the lockfile), `builder` (`npm run build`), `runner` (standalone output only), on `node:22-alpine` with `libc6-compat` for the glibc symbols Next's precompiled binaries expect. Runs as non-root `nextjs`.
   - `next.config.ts` now sets `output: "standalone"`, so the runtime stage ships `server.js` plus only the `node_modules` actually needed instead of the full tree.
@@ -254,9 +254,137 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - **PyMuPDF import modernized (follow-up, now done):** the 3.11 container run surfaced `DeprecationWarning: The 'fitz' API is deprecated ... Use 'import pymupdf' instead.` Renamed `import fitz` → `import pymupdf` across `document_parser.py`, `layout_parser.py`, and the two test modules that build fixture PDFs (`test_document_processing.py`, `test_ingestion.py`) — the warning fires on the import itself, so the test files mattered as much as the services. `pymupdf.open`/`Document`/`Rect`/`Page` were confirmed to be the *same objects* as their `fitz` counterparts before renaming, so this is an alias change with no behavioral difference. Verified in the CI-equivalent 3.11 container: `python -W error::DeprecationWarning -c "import app.main"` passes, and the suite runs 114/114.
 - The one remaining warning in that container comes from `starlette/testclient.py` (`anyio.abc.BlockingPortal` alias deprecated) — third-party code, not this project's, and not suppressed.
 
-### Phase 2 Execution Roadmap (Planned)
+**Module 12 (continued) — Infrastructure as Code & Hybrid Deployment — ✅ Implemented**
+- **`infrastructure/` (Terraform, AWS provider ~> 5.0):** `main.tf`, `variables.tf`, `outputs.tf`, plus a tracked `terraform.tfvars.example`. Provisions a VPC with two public subnets across distinct AZs (an ALB requires a minimum of two — enforced by a `validation` block on the CIDR list rather than left to fail at apply time), an internet gateway and route table, two security groups, an Application Load Balancer with an HTTP listener and target group, a CloudWatch log group, an ECS cluster, a Fargate task definition, and the ECS service.
+- **ECS on Fargate, not EC2** (the roadmap line said "AWS EC2/RDS"): the deliverable asked explicitly for ECS + Fargate, and RDS is superseded by Supabase, which already provides Postgres *and* the Auth/JWKS issuer that Module 9's token verification depends on. Running RDS as well would mean two Postgres instances and a second identity story.
+- **Security groups implement least privilege rather than the literal brief.** The request was "allow ingress on port 8000"; opening 8000 to `0.0.0.0/0` would let callers reach tasks directly and bypass the load balancer entirely. Instead the ALB security group takes 80/443 from the internet, and the task security group accepts 8000 **only from the ALB's security group**. That satisfies the requirement while keeping the API reachable through exactly one path.
+- **Tasks run in public subnets with `assign_public_ip = true`** — a deliberate cost tradeoff, documented in-file. Fargate in a private subnet needs a NAT gateway (~$32/mo) to pull from ECR and reach Supabase/Upstash/Groq. The security group is what provides isolation here, not subnet placement. Without the public IP the task cannot pull its image and silently fails to start.
+- **Two IAM roles, kept separate.** The *execution* role is assumed by the ECS agent to pull the image and write logs (`AmazonECSTaskExecutionRolePolicy`), plus an inline policy granting `ssm:GetParameters`/`secretsmanager:GetSecretValue` scoped to exactly the ARNs passed in — the managed policy does **not** cover secret reads, so the `secrets` block fails at task start without it. The *task* role, assumed by the application, is intentionally empty: the backend talks only to Supabase, Upstash, and HTTP AI providers and needs no AWS API access. It exists as the attachment point for future grants and to keep application permissions distinct from the agent's.
+- **Secrets never enter Terraform state or the task definition.** They are referenced by SSM/Secrets Manager ARN through the task definition's `secrets` block and resolved by the agent at task start. Non-secret config (`ENVIRONMENT`, `CORS_ALLOWED_ORIGINS`, `SUPABASE_URL`) is plain `environment`.
+- The target group uses `target_type = "ip"` (required for Fargate — tasks register by ENI address, there is no instance to attach), health-checks the existing `/health` route, and sets `deregistration_delay = 30` so in-flight SSE streams can finish without the default 300s stalling every deploy. The service sets `lifecycle.ignore_changes = [task_definition]` so Terraform does not revert an image deploy performed by `aws ecs update-service`.
+- **`DEPLOYMENT.md`** documents the hybrid topology (Vercel edge frontend → ALB → Fargate → Supabase/Upstash) end to end: provisioning the managed stores, storing secrets in SSM, building and pushing to ECR, `terraform init/plan/apply`, running `init_db` against Supabase, configuring Vercel, redeploying, teardown, and cost.
+- **⚠️ Documented blocker:** the ALB provisions an **HTTP-only** listener, because an HTTPS listener needs an ACM certificate and a domain that Terraform cannot invent. A Vercel-hosted frontend is served over HTTPS and browsers **block mixed active content**, so every API call to an `http://` ALB fails — the stack would look deployed and be unusable. `DEPLOYMENT.md` leads with this and gives the HTTPS listener + redirect + ACM steps to close it.
+- **Verified by `terraform fmt`, `init`, and `validate` against the real `hashicorp/aws` provider schema** (run through the `hashicorp/terraform:1.9` Docker image rather than installing Terraform on the host). The configuration is **valid but has never been applied** — no AWS resources were created, so runtime behavior (task startup, target health, secret resolution) is unverified.
+- `.gitignore` now excludes `*.tfstate*`, `*.tfplan`, `.terraform/`, and `terraform.tfvars`, while deliberately **tracking** `.terraform.lock.hcl` (it pins provider versions). State is the critical exclusion: it stores resolved secret values in plaintext.
 
-**Module 12 (continued): Cloud Deployment**
-- **Infrastructure as Code (IaC):** Write Terraform modules to provision cloud infrastructure (AWS EC2/RDS). Not started — the containerization and CI portions above are what shipped.
-- **Hybrid Deployment:** Host the Next.js application on Vercel's global Edge Network while orchestrating the backend containers through AWS. Not started.
+---
+
+## Row-Level Security enforcement (post-Module-12 hardening)
+
+Closes the isolation gap that had been documented as open since Module 9.
+
+**The root cause was the connection role, not the policies.** Postgres exempts
+`SUPERUSER` and `BYPASSRLS` roles from every RLS policy *unconditionally* — no
+table-level flag overrides that, `FORCE ROW LEVEL SECURITY` included (verified
+directly against this database: with `FORCE` set, an admin connection still
+read every tenant's rows). The policies were correct all along; the app simply
+connected as `postgres`.
+
+- **`init_db()` now provisions a restricted role.** `settings.app_db_role`
+  (default `sourceguard_app`) is created with `LOGIN`, explicitly altered
+  `NOSUPERUSER NOBYPASSRLS` (in case it pre-existed with either), and granted
+  `SELECT/INSERT/UPDATE/DELETE` on the app tables plus `USAGE` on the schema —
+  no DDL, no ownership. `ALTER DEFAULT PRIVILEGES` covers tables added by
+  later migrations. It is deliberately **not** the table owner: an owner
+  bypasses RLS unless `FORCE` is set, and resting isolation on one easily
+  missed flag is a worse design than simply not being the owner.
+- **Two connection URLs.** `ADMIN_DATABASE_URL` (superuser) is used *only* by
+  `init_db` for DDL; `DATABASE_URL` is the restricted runtime role. The admin
+  URL falls back to `DATABASE_URL` when unset so a single-URL local bootstrap
+  still works.
+- **RLS extended to all five tenant tables** — `workspaces`, `documents`,
+  `document_chunks`, `chat_sessions`, `chat_messages`. `documents` and
+  `document_chunks` previously had none; their policies reach the owner
+  through the parent workspace, so a row is visible only when its entire
+  ancestry is owned by the caller. `init_db` is now the single source of
+  truth for every policy (the chat policies had been created by the temporary
+  Module 10 migration script and were missing from a fresh bootstrap).
+- **Policies read `NULLIF(current_setting('app.current_user_id', true), '')::uuid`.**
+  The `NULLIF` is load-bearing: `current_setting(..., true)` returns NULL when
+  never set, but an *empty string* once cleared, and `''::uuid` raises
+  `invalid input syntax for type uuid` — turning a cleared context into a
+  query error rather than a clean "no rows". `NULLIF` collapses both to NULL
+  so the policy fails closed. Verified both paths.
+- With no `FOR` clause the policies are `FOR ALL`, and with `WITH CHECK`
+  omitted the `USING` expression governs writes too — so a caller cannot
+  insert a row it would not be allowed to read. Confirmed: an attempt to
+  insert a workspace owned by another user is rejected.
+
+**The tenant variable is now session-scoped, not transaction-scoped.**
+`get_authenticated_db` sets it via `set_config(..., false)`. Transaction scope
+looks more conservative and is wrong here: several endpoints commit
+mid-request (`create_workspace` commits then refreshes; `stream_query` saves
+the user turn, generates, then saves the assistant turn), and a
+transaction-scoped setting is discarded at each commit — every subsequent
+query would run with no tenant context and, under enforced RLS, correctly
+return nothing, breaking the request. This latent bug was invisible while RLS
+was inert, because the superuser bypassed the policies regardless.
+
+Session scope introduces a pooled-connection risk in exchange, which
+`get_db` closes: its `finally` clears the variable before the connection
+returns to the pool, so a later request that never sets one cannot inherit the
+previous user's context. Verified — after teardown the next session reads `''`
+and sees zero rows.
+
+**Verified against live Postgres, connected as the restricted role:**
+
+| Check | Result |
+| --- | --- |
+| Role attributes | `rolsuper=false`, `rolbypassrls=false` |
+| All five tables | `relrowsecurity=true`, `relforcerowsecurity=true` |
+| User A lists workspaces | sees only A's |
+| User B lists workspaces | sees only B's |
+| A inserts a row owned by B | blocked by the policy |
+| No tenant context set | 0 rows (fails closed) |
+| Cross-tenant document access via API | 404 |
+| Full request flow (create → upload → multi-commit stream) | works end to end |
+| Context after request teardown | cleared, no leak |
+
+The 114-test suite runs on SQLite, which has no RLS, so it cannot exercise
+any of the above — hence the direct Postgres verification. The suite continues
+to pass unchanged.
+
+## Project Status
+
+**All twelve modules across both phases are complete.** Phase 1 (Modules 1–4)
+delivered ingestion, the vector/relational store, hybrid retrieval with
+claim verification, and the streaming API. Phase 2 (Modules 5–12) delivered
+the frontend, auth and multi-tenancy, rate limiting, conversation memory,
+layout-aware ingestion, and containerization/CI/IaC. **114 backend tests
+pass**; `tsc`, `eslint`, and `next build` are clean; both Docker images build
+and run; the Terraform configuration validates.
+
+The multi-tenant isolation gap that previously qualified this status is
+closed: **Row-Level Security is now enforced by Postgres**, not merely
+defined. What remains below is deferred infrastructure and verification work,
+not a correctness or security defect.
+
+**Security**
+- ✅ **RLS is enforced** on all five tenant tables, by the database, as of the
+  post-Module-12 hardening pass. Application-layer checks remain as a second
+  layer.
+- `Workspace.name` is globally unique rather than per-user, so two tenants
+  cannot both have a workspace named "Research". A uniqueness-constraint
+  change, not an isolation gap — RLS already prevents cross-tenant reads.
+- The ALB terminates HTTP only; TLS is required before the Vercel frontend
+  can talk to it at all. **Deferred** — needs an ACM certificate and a domain.
+  Steps are in `DEPLOYMENT.md`.
+
+**Verification**
+- The Terraform configuration validates but has never been applied — no AWS
+  runtime behavior has been observed.
+- The frontend has no interactive browser-level verification (no
+  browser-automation tool available in the development environment); it is
+  covered by builds, type/lint checks, and contract tests against the real
+  backend.
+- RLS policies and the `set_config` tenant wiring cannot be exercised by the
+  test suite, which runs on SQLite.
+
+**Deferred product work**
+- Workspace creation still uses `window.prompt` rather than an in-app form
+  (deferred since Module 5).
+- CI tests and builds but does not deploy; image pushes and `terraform apply`
+  are manual.
+- One third-party deprecation warning remains from `starlette/testclient.py`,
+  deliberately not suppressed.
 

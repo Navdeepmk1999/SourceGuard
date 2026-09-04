@@ -22,8 +22,30 @@ class Settings(BaseSettings):
     app_name: str = "SourceGuard"
     environment: str = "development"
 
-    # Database (loaded from DATABASE_URL in .env)
+    # Database (loaded from DATABASE_URL in .env).
+    #
+    # SECURITY: this must point at a NON-SUPERUSER role without BYPASSRLS, or
+    # the Row-Level Security policies in app/db/init_db.py are silently
+    # inert - Postgres exempts superusers and BYPASSRLS roles from every
+    # policy. `init_db()` provisions exactly such a role (see app_db_role).
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/sourceguard"
+
+    # Elevated connection used ONLY by app/db/init_db.py for DDL: creating
+    # the extension, tables, the restricted role, grants, and policies - none
+    # of which the restricted runtime role can do. Falls back to
+    # `database_url` when unset, which keeps a single-URL local setup working
+    # for bootstrap.
+    admin_database_url: str = ""
+
+    # The non-superuser role the application connects as. `init_db()` creates
+    # it and grants it CRUD on the app tables (never DDL, never BYPASSRLS).
+    app_db_role: str = "sourceguard_app"
+    app_db_password: str = ""
+
+    @property
+    def bootstrap_database_url(self) -> str:
+        """Connection used for DDL/bootstrap - the admin URL when configured."""
+        return self.admin_database_url or self.database_url
 
     # Redis / Upstash cache
     redis_url: str = "redis://localhost:6379/0"

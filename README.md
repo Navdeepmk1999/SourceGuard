@@ -36,7 +36,12 @@ cd backend
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 # Create backend/.env with the variables in the table below
-python -m app.db.init_db      # creates tables, pgvector ext, RLS policies
+# Bootstrap: creates tables, the pgvector extension, the restricted
+# application role, and the RLS policies. Needs the ADMIN connection.
+ADMIN_DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/sourceguard" \
+  APP_DB_PASSWORD="choose-a-password" python -m app.db.init_db
+# Then point DATABASE_URL at the restricted role it just created:
+#   postgresql+asyncpg://sourceguard_app:<that password>@localhost:5432/sourceguard
 uvicorn app.main:app --reload
 
 # Frontend
@@ -55,7 +60,10 @@ distinct origins to the browser.
 
 | Variable | Required | Notes |
 | --- | --- | --- |
-| `DATABASE_URL` | yes | `postgresql+asyncpg://...` |
+| `DATABASE_URL` | yes | `postgresql+asyncpg://...`. **Must be the restricted, non-superuser role** (see below) — a superuser bypasses Row-Level Security entirely. |
+| `ADMIN_DATABASE_URL` | for bootstrap | Superuser connection, used only by `app.db.init_db` for DDL. Falls back to `DATABASE_URL`. |
+| `APP_DB_PASSWORD` | for bootstrap | Password `init_db` assigns to the restricted role it creates. |
+| `APP_DB_ROLE` | no | Restricted role name (default `sourceguard_app`). |
 | `SUPABASE_URL` | yes | Project URL; used to build the JWKS endpoint. Not a secret. |
 | `REDIS_URL` | no | Defaults to `redis://localhost:6379/0`. |
 | `GROQ_API_KEY` | no | Unset ⇒ deterministic offline mock generation. |
@@ -195,8 +203,17 @@ Redis, or network access required.
 
 ## Security note
 
-Row-Level Security policies are defined on `workspaces`, `chat_sessions`,
-and `chat_messages`, **but are currently inert**: the app connects to
-Postgres as the `postgres` superuser, which carries `BYPASSRLS`. Tenant
-isolation today is enforced in the application layer. See the Module 9
-section of `DESIGN.md` for detail and the fix.
+Row-Level Security is **enforced** on `workspaces`, `documents`,
+`document_chunks`, `chat_sessions`, and `chat_messages`. The application
+connects as a restricted role (`sourceguard_app`) that `init_db` provisions
+with `NOSUPERUSER NOBYPASSRLS`, so Postgres applies every policy — a
+superuser connection would bypass them all regardless of how the policies
+are written.
+
+If you point `DATABASE_URL` at a superuser, isolation silently reverts to
+application-layer checks only. Verify with:
+
+```sql
+SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user;
+-- both must be false
+```
