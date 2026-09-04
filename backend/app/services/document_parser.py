@@ -6,16 +6,38 @@ from fastapi import HTTPException
 
 from app.schemas.document import DocumentType, ParsingResult
 from app.services.chunker import RecursiveChunker
+from app.services.layout_parser import LayoutParser
+from app.services.semantic_chunker import SemanticChunker
 
 SUPPORTED_SUFFIXES = {".pdf": DocumentType.PDF, ".txt": DocumentType.TXT}
 
 
 class DocumentParser:
-    """Parses PDF and TXT documents into raw text, then delegates chunking
-    to `RecursiveChunker` to produce a `ParsingResult`."""
+    """Parses PDF and TXT documents into structural elements (headings,
+    paragraphs, lists, tables) and chunks them on semantic boundaries to
+    produce a `ParsingResult`.
 
-    def __init__(self, chunker: RecursiveChunker | None = None) -> None:
+    Module 11 replaced the flat text -> `RecursiveCharacterTextSplitter`
+    path with `LayoutParser` -> `SemanticChunker`. `parse_pdf_bytes` /
+    `parse_txt_bytes` are retained: they remain the raw-text accessors and
+    keep the 422 decode/parse error contract that the upload endpoint and
+    its regression tests depend on.
+    """
+
+    def __init__(
+        self,
+        chunker: RecursiveChunker | None = None,
+        layout_parser: LayoutParser | None = None,
+        semantic_chunker: SemanticChunker | None = None,
+    ) -> None:
         self._chunker = chunker or RecursiveChunker()
+        self._layout_parser = layout_parser or LayoutParser()
+        # Inherits the ceiling from whatever RecursiveChunker was configured
+        # with, so `DocumentParser(RecursiveChunker(chunk_size=...))` keeps
+        # controlling chunk size as it did before Module 11.
+        self._semantic_chunker = semantic_chunker or SemanticChunker(
+            max_chunk_size=self._chunker.chunk_size
+        )
 
     def parse_pdf_bytes(self, content: bytes) -> tuple[str, int]:
         """Extract text from raw PDF bytes. Returns (full_text, page_count)."""
@@ -60,13 +82,15 @@ class DocumentParser:
 
         total_pages: int | None = None
         if document_type == DocumentType.PDF:
-            text, total_pages = self.parse_pdf_bytes(content)
+            elements, total_pages = self._layout_parser.parse_pdf(content)
         else:
-            text = self.parse_txt_bytes(content)
+            # Decoded via parse_txt_bytes so the 422 contract for undecodable
+            # bytes is unchanged.
+            elements = self._layout_parser.parse_text(self.parse_txt_bytes(content))
 
         document_id = str(uuid.uuid4())
-        chunks = self._chunker.chunk_text(
-            text,
+        chunks = self._semantic_chunker.chunk_elements(
+            elements,
             document_id=document_id,
             extra_metadata={"filename": filename, "document_type": document_type.value},
         )

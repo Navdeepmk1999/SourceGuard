@@ -34,8 +34,20 @@ class GenerationService:
             await self._client.aclose()
             self._client = None
 
-    async def stream_answer(self, query: str, context_chunks: list[str]) -> AsyncIterator[str]:
-        """Yields answer tokens one at a time."""
+    async def stream_answer(
+        self,
+        query: str,
+        context_chunks: list[str],
+        history: list[dict[str, str]] | None = None,
+    ) -> AsyncIterator[str]:
+        """Yields answer tokens one at a time.
+
+        `history` is the Module 10 sliding-window conversation memory: prior
+        `{role, content}` turns, oldest-first, spliced in *before* the
+        current question so the model can resolve references to earlier
+        turns ("it", "that document", follow-up questions). Defaults to None
+        for a first turn or any caller that doesn't track a conversation.
+        """
         if not self.is_live:
             async for token in self._mock_stream(query, context_chunks):
                 yield token
@@ -43,13 +55,18 @@ class GenerationService:
 
         client = await self._get_client()
         prompt = self._build_prompt(query, context_chunks)
+        # Retrieved context + the current question go in the final user
+        # message; prior turns precede it as their own messages rather than
+        # being flattened into the prompt string, so the model sees a real
+        # multi-turn exchange with correct role attribution.
+        messages = [*(history or []), {"role": "user", "content": prompt}]
         try:
             async with client.stream(
                 "POST",
                 "/chat/completions",
                 json={
                     "model": self._settings.groq_model,
-                    "messages": [{"role": "user", "content": prompt}],
+                    "messages": messages,
                     "stream": True,
                 },
                 headers={"Authorization": f"Bearer {self._settings.groq_api_key}"},

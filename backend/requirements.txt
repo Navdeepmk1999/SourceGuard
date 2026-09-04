@@ -1,6 +1,8 @@
 fastapi
 uvicorn[standard]
 pydantic-settings
+# PDF text extraction AND (Module 11) layout-aware parsing: find_tables()
+# + per-span font metadata. Pure-Python wheel - no poppler/tesseract.
 pymupdf
 langchain-text-splitters
 pytest
@@ -26,3 +28,11 @@ python-multipart
 
 # Auth (Supabase-issued JWT verification via JWKS - ES256, asymmetric)
 pyjwt[crypto]
+
+# Rate limiting (sliding-window, backed by Redis)
+redis
+
+# Observability: explicit @traceable spans on the RAG pipeline. NOT LangChain
+# auto-instrumentation - this backend makes no LangChain/LangGraph LLM calls
+# (see app/services/telemetry.py).
+langsmith

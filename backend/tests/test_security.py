@@ -5,13 +5,43 @@ import jwt
 import pytest_asyncio
 from cryptography.hazmat.primitives.asymmetric import ec
 from httpx import ASGITransport, AsyncClient
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.deps import get_current_user
+from app.api.deps import (
+    QUERY_RATE_LIMIT_MAX_REQUESTS,
+    get_current_user,
+    get_redis_client,
+)
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.main import app
 from app.models import Base, Workspace
+
+
+class _FakeRedis:
+    """In-memory reimplementation of `_SLIDING_WINDOW_SCRIPT`'s exact
+    semantics (app/api/deps.py), so rate-limited routes work in tests
+    without a real Redis connection. Needed for more than convenience: the
+    real async Redis client's connection pool binds to the event loop it was
+    created in, and a module-level cached client (matching `_get_jwk_client`'s
+    pattern) breaks across pytest-asyncio's per-test event loops with
+    `RuntimeError: Event loop is closed`."""
+
+    def __init__(self) -> None:
+        self._zsets: dict[str, dict[str, float]] = {}
+
+    async def eval(self, script, numkeys, key, now, window, limit, member):
+        now, window, limit = float(now), float(window), int(limit)
+        zset = self._zsets.setdefault(key, {})
+        cutoff = now - window
+        for m, score in list(zset.items()):
+            if score < cutoff:
+                del zset[m]
+        if len(zset) >= limit:
+            return 0
+        zset[member] = now
+        return 1
 
 # Real verification (app/api/deps.py::get_current_user) is JWKS/ES256, not a
 # shared HS256 secret - this project's actual Supabase signing key is
@@ -82,7 +112,9 @@ async def real_auth_client(session_maker, monkeypatch):
         async with session_maker() as session:
             yield session
 
+    fake_redis = _FakeRedis()
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_redis_client] = lambda: fake_redis
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
@@ -105,8 +137,10 @@ async def multi_user_client(session_maker):
         assert current_user["id"] is not None, "set current_user['id'] before making a request"
         return current_user["id"]
 
+    fake_redis = _FakeRedis()
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = override_get_current_user
+    app.dependency_overrides[get_redis_client] = lambda: fake_redis
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac, current_user
@@ -264,3 +298,79 @@ class TestOwnershipStamping:
             workspace = await session.get(Workspace, workspace_id)
             assert workspace is not None
             assert workspace.user_id == user_id
+
+
+class TestQueryRateLimiting:
+    """`app/api/deps.py::rate_limit_user`, applied to `POST /api/v1/query/
+    stream` - the most critical endpoint to protect, per Module 9's rate-
+    limiting scope. Uses a nonexistent `workspace_id`: requests that get
+    past the rate limiter reach normal business logic and 404 (workspace
+    not found) - the rate limiter itself doesn't care whether the workspace
+    is real, only whether the caller has budget left within the window."""
+
+    async def test_requests_under_the_limit_pass_through_to_normal_processing(
+        self, multi_user_client
+    ):
+        client, current_user = multi_user_client
+        current_user["id"] = uuid.uuid4()
+        payload = {"workspace_id": str(uuid.uuid4()), "query": "anything"}
+
+        for i in range(QUERY_RATE_LIMIT_MAX_REQUESTS):
+            response = await client.post("/api/v1/query/stream", json=payload)
+            assert response.status_code == 404, f"request {i + 1} should have passed the rate limiter"
+
+    async def test_request_exceeding_the_limit_returns_429(self, multi_user_client):
+        client, current_user = multi_user_client
+        current_user["id"] = uuid.uuid4()
+        payload = {"workspace_id": str(uuid.uuid4()), "query": "anything"}
+
+        for i in range(QUERY_RATE_LIMIT_MAX_REQUESTS):
+            response = await client.post("/api/v1/query/stream", json=payload)
+            assert response.status_code == 404, f"request {i + 1} should have passed the rate limiter"
+
+        response = await client.post("/api/v1/query/stream", json=payload)
+        assert response.status_code == 429
+
+    async def test_rate_limiter_fails_open_when_redis_is_unavailable(
+        self, multi_user_client, monkeypatch
+    ):
+        """A Redis outage must not take the API down with it. `_check_rate_limit`
+        swallows RedisError and allows the request through (see its docstring
+        for why availability wins over strict enforcement here) - so far more
+        than the limit's worth of requests should still pass to normal
+        processing rather than 429-ing or 500-ing."""
+        client, current_user = multi_user_client
+        current_user["id"] = uuid.uuid4()
+        payload = {"workspace_id": str(uuid.uuid4()), "query": "anything"}
+
+        class _BrokenRedis:
+            async def eval(self, *args, **kwargs):
+                # redis.exceptions.ConnectionError (a RedisError), NOT Python's
+                # builtin ConnectionError - the builtin is an OSError and would
+                # not be caught by _check_rate_limit's `except RedisError`.
+                raise RedisConnectionError("Redis is down")
+
+        app.dependency_overrides[get_redis_client] = _BrokenRedis
+
+        for i in range(QUERY_RATE_LIMIT_MAX_REQUESTS + 5):
+            response = await client.post("/api/v1/query/stream", json=payload)
+            assert response.status_code == 404, (
+                f"request {i + 1} should have failed open past the rate limiter, "
+                f"got {response.status_code}"
+            )
+
+    async def test_rate_limit_is_scoped_per_user(self, multi_user_client):
+        """User A hitting their limit must not affect User B's own budget."""
+        client, current_user = multi_user_client
+        user_a, user_b = uuid.uuid4(), uuid.uuid4()
+        payload = {"workspace_id": str(uuid.uuid4()), "query": "anything"}
+
+        current_user["id"] = user_a
+        for _ in range(QUERY_RATE_LIMIT_MAX_REQUESTS):
+            await client.post("/api/v1/query/stream", json=payload)
+        exhausted = await client.post("/api/v1/query/stream", json=payload)
+        assert exhausted.status_code == 429
+
+        current_user["id"] = user_b
+        response = await client.post("/api/v1/query/stream", json=payload)
+        assert response.status_code == 404

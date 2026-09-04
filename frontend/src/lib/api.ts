@@ -166,9 +166,16 @@ export function getWorkspaceDocuments(workspaceId: string): Promise<WorkspaceDoc
 }
 
 export type QueryStreamEvent =
+  | { type: "session"; session_id: string }
   | { type: "token"; token: string }
   | { type: "verification"; claim: ClaimVerification }
-  | { type: "done"; answer: string; overall_score: number; is_fully_supported: boolean }
+  | {
+      type: "done";
+      answer: string;
+      session_id: string | null;
+      overall_score: number;
+      is_fully_supported: boolean;
+    }
   | { type: "error"; detail: string };
 
 /**
@@ -187,6 +194,14 @@ function toQueryStreamEvent(eventName: string, payload: unknown): QueryStreamEve
   const data = payload as Record<string, unknown>;
 
   switch (eventName) {
+    // Module 10: emitted first, before any token, so a client that started a
+    // new conversation (session_id null) learns the id even if the stream
+    // later errors.
+    case "session":
+      return typeof data.session_id === "string"
+        ? { type: "session", session_id: data.session_id }
+        : null;
+
     case "token":
       return typeof data.token === "string" ? { type: "token", token: data.token } : null;
 
@@ -217,6 +232,10 @@ function toQueryStreamEvent(eventName: string, payload: unknown): QueryStreamEve
         return {
           type: "done",
           answer: data.answer,
+          // Present since Module 10, but tolerated as absent rather than
+          // failing the whole frame - the `session` event is the primary
+          // carrier and a `done` without it is still a usable answer.
+          session_id: typeof data.session_id === "string" ? data.session_id : null,
           overall_score: data.overall_score,
           is_fully_supported: data.is_fully_supported,
         };
@@ -244,7 +263,8 @@ function toQueryStreamEvent(eventName: string, payload: unknown): QueryStreamEve
  */
 export async function* streamQuery(
   workspaceId: string,
-  query: string
+  query: string,
+  sessionId: string | null = null
 ): AsyncGenerator<QueryStreamEvent, void, void> {
   if (!API_BASE_URL) {
     throw new ApiError(
@@ -260,7 +280,13 @@ export async function* streamQuery(
     response = await fetch(`${API_BASE_URL}/query/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders },
-      body: JSON.stringify({ workspace_id: workspaceId, query }),
+      // session_id null starts a new conversation server-side; the backend
+      // then returns the new id on the `session` event.
+      body: JSON.stringify({
+        workspace_id: workspaceId,
+        query,
+        session_id: sessionId,
+      }),
     });
   } catch (cause) {
     throw new ApiError(

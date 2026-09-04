@@ -52,6 +52,26 @@ class Settings(BaseSettings):
     # 500) rather than accepting unverifiable tokens.
     supabase_url: str = ""
 
+    # LangSmith telemetry (Module 10). NOTE: this codebase makes no LangChain
+    # or LangGraph LLM calls - generation is a direct httpx stream to Groq's
+    # API, and the only langchain import anywhere is the pure-text
+    # RecursiveCharacterTextSplitter in app/services/chunker.py. So
+    # LANGCHAIN_TRACING_V2 alone would auto-instrument nothing; tracing is
+    # emitted by explicit @traceable decorators in app/services/telemetry.py.
+    # Both names are read: LANGSMITH_* is the current convention, LANGCHAIN_*
+    # the legacy one that the langsmith SDK still honors.
+    langchain_tracing_v2: bool = False
+    langsmith_tracing: bool = False
+    langsmith_api_key: str = ""
+    langsmith_project: str = "sourceguard"
+
+    @property
+    def tracing_enabled(self) -> bool:
+        """True only when tracing is switched on AND an API key exists - a
+        key-less 'enabled' would make every traced call emit failing network
+        requests to LangSmith on the request path."""
+        return bool((self.langchain_tracing_v2 or self.langsmith_tracing) and self.langsmith_api_key)
+
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
     def _split_comma_separated_origins(cls, value: object) -> object:
