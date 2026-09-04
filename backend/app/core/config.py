@@ -1,8 +1,9 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Resolve .env relative to the backend/ directory so it loads regardless of
 # the working directory the app or tests are invoked from.
@@ -62,8 +63,17 @@ class Settings(BaseSettings):
     chunk_size: int = 1000
     chunk_overlap: int = 200
 
-    # CORS: origins allowed to call this API (comma-separated in .env)
-    cors_allowed_origins: list[str] = ["http://localhost:3000"]
+    # CORS: origins allowed to call this API (comma-separated in .env).
+    #
+    # `NoDecode` is required, not cosmetic. pydantic-settings treats a
+    # `list[str]` field as "complex" and runs `json.loads()` on the raw
+    # environment value inside the settings source - which happens BEFORE any
+    # `field_validator(mode="before")`. Without NoDecode, a plain value like
+    # `https://app.vercel.app` (or a comma-separated pair) raises
+    # SettingsError at import and the process never starts; only a JSON array
+    # would parse. NoDecode suppresses that decode so the validator below
+    # actually receives the string and can split it.
+    cors_allowed_origins: Annotated[list[str], NoDecode] = ["http://localhost:3000"]
 
     # Auth: verifies Supabase-issued JWTs via JWKS (see app/api/deps.py::
     # get_current_user). This project's Supabase signing key is ES256/

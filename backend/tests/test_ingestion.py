@@ -3,6 +3,7 @@
 import pymupdf
 import pytest
 
+from app.core.config import Settings
 from app.services.document_parser import DocumentParser
 from app.services.layout_parser import ElementType, LayoutElement, LayoutParser
 from app.services.semantic_chunker import SemanticChunker
@@ -272,3 +273,42 @@ class TestDocumentParserIntegration:
         combined = "\n".join(c.content for c in result.chunks)
         assert "First paragraph here." in combined
         assert "- item one" in combined
+
+
+class TestSettingsEnvParsing:
+    """Guards the config parsing that every deployment path depends on.
+
+    `CORS_ALLOWED_ORIGINS` is a `list[str]`, which pydantic-settings treats as
+    a "complex" field and JSON-decodes inside the settings source - *before*
+    any `field_validator(mode="before")` runs. Without `NoDecode`, a plain
+    origin string raises SettingsError at import and the process never starts.
+    That crashed every deployment path (Render, Compose, ECS) while local dev
+    stayed green, because local dev never sets the variable and falls back to
+    the default.
+    """
+
+    def test_single_origin_from_env_parses(self, monkeypatch):
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://app.vercel.app")
+        assert Settings(_env_file=None).cors_allowed_origins == ["https://app.vercel.app"]
+
+    def test_comma_separated_origins_parse(self, monkeypatch):
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://a.com,https://b.com")
+        assert Settings(_env_file=None).cors_allowed_origins == ["https://a.com", "https://b.com"]
+
+    def test_whitespace_around_origins_is_stripped(self, monkeypatch):
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", " https://a.com , https://b.com ")
+        assert Settings(_env_file=None).cors_allowed_origins == ["https://a.com", "https://b.com"]
+
+    def test_default_applies_when_unset(self, monkeypatch):
+        monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
+        assert Settings(_env_file=None).cors_allowed_origins == ["http://localhost:3000"]
+
+    def test_app_imports_with_origins_set(self, monkeypatch):
+        """The actual failure mode: the app would not start at all."""
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://app.vercel.app")
+        import importlib
+
+        import app.core.config as config_module
+
+        importlib.reload(config_module)
+        assert config_module.Settings(_env_file=None).cors_allowed_origins

@@ -1,7 +1,12 @@
-# SourceGuard - System Design & Architecture (As-Built)
+# SourceGuard — System Design & Architecture (As-Built)
 
-This document describes the system **as implemented** across Modules 1–4. For
-the fixed engineering guidelines the codebase is held to, see `CLAUDE.md`.
+This document describes the system **as implemented** across all twelve
+modules of Phases 1 and 2. It records what was built and, where a decision was
+non-obvious, why that option was chosen over the alternatives.
+
+For the fixed engineering standards the codebase is held to, see `CLAUDE.md`.
+For the chronological build history, see `WORKLOG.md`. For deployment
+procedure, see `DEPLOYMENT.md`.
 
 ## Technology Stack (As Implemented)
 - **Language & Runtime:** Python 3.11+, FastAPI (async/await), Pydantic v2.
@@ -113,7 +118,7 @@ The column type that lets `DocumentChunk.embedding` be a genuine `pgvector` colu
 
 **CORS — `app/main.py`**
 - All three routers are wired via `app.include_router()`.
-- `CORSMiddleware` enforces a strict policy: an explicit origin allow-list (`settings.cors_allowed_origins`, default `["http://localhost:3000"]`, overridable in `.env` as a comma-separated string via a `field_validator`), `allow_credentials=True`, and methods/headers restricted to exactly what the API needs (`GET`, `POST`, `OPTIONS`; `Content-Type`, `Authorization`) — no wildcard origins, methods, or headers.
+- `CORSMiddleware` enforces a strict policy: an explicit origin allow-list (`settings.cors_allowed_origins`, default `["http://localhost:3000"]`, overridable as a comma-separated string via a `field_validator`, which requires the field to be annotated `NoDecode` — pydantic-settings JSON-decodes `list[str]` env values inside the settings source, before any validator runs, so without it a plain origin string raises `SettingsError` at import and the process never starts), `allow_credentials=True`, and methods/headers restricted to exactly what the API needs (`GET`, `POST`, `OPTIONS`; `Content-Type`, `Authorization`) — no wildcard origins, methods, or headers.
 
 ---
 

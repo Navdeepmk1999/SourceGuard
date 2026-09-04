@@ -27,3 +27,7 @@ crash.log
 # Real variable values (ARNs, origins); the .example file is tracked.
 terraform.tfvars
 *.auto.tfvars
+
+# Private study / interview-prep material. Local only, not part of the
+# public portfolio surface.
+docs/

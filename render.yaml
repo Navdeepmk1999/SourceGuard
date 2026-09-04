@@ -1,0 +1,126 @@
+# Render Blueprint — SourceGuard backend
+#
+# Declarative infrastructure for the primary deployment (see DEPLOYMENT.md).
+# Apply with: Render Dashboard → New → Blueprint → select this repository.
+#
+# Scope: the FastAPI backend only. The Next.js frontend deploys to Vercel and
+# is not expressible here; Postgres (Supabase) and Redis (Upstash) are managed
+# externally rather than provisioned by Render, so their credentials arrive as
+# environment variables below.
+#
+# The AWS/ECS Terraform equivalent lives in infrastructure/ and is retained as
+# the enterprise-scale alternative, not the live deployment.
+
+services:
+  - type: web
+    name: sourceguard-backend
+    runtime: docker
+    plan: free
+
+    # Pick the region closest to the Supabase project — every request makes
+    # several round trips to Postgres, so cross-region placement shows up
+    # directly in query latency.
+    region: oregon
+
+    # Build context is backend/, which is what backend/Dockerfile expects
+    # (`COPY requirements.txt ./`, `COPY . .`) and what makes
+    # backend/.dockerignore apply. dockerfilePath is resolved relative to
+    # rootDir; if a build ever fails to locate it, try ./backend/Dockerfile.
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+
+    # backend/Dockerfile hardcodes `--port 8000` because Compose and ECS both
+    # expect a fixed port. Render assigns one dynamically via $PORT, so the
+    # start command is overridden here rather than changing the Dockerfile —
+    # keeping a single image identical across local, CI, ECS, and Render.
+    dockerCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    # Matches the liveness route in app/main.py. Deliberately dependency-free:
+    # it answers "is this process alive?", not "is Postgres reachable?", so a
+    # transient database blip cannot cause Render to cycle a healthy instance.
+    healthCheckPath: /health
+
+    autoDeploy: true
+
+    # Skip rebuilds for commits that cannot affect this service — a docs-only
+    # or frontend-only change should not redeploy the API.
+    buildFilter:
+      paths:
+        - backend/**
+        - render.yaml
+
+    envVars:
+      # ---- Database -----------------------------------------------------
+      # MUST satisfy two constraints, neither of which fails loudly:
+      #
+      #   1. The RESTRICTED role (sourceguard_app), never a superuser.
+      #      PostgreSQL exempts SUPERUSER/BYPASSRLS roles from every RLS
+      #      policy unconditionally, so a superuser connection silently
+      #      disables tenant isolation.
+      #
+      #   2. SESSION MODE — port 5432, never the transaction pooler on 6543.
+      #      The RLS tenant context is a session-scoped variable; transaction
+      #      pooling returns the connection between transactions, which breaks
+      #      the context and can leak it across tenants.
+      #
+      #   postgresql+asyncpg://sourceguard_app:<pw>@<host>:5432/postgres
+      #
+      # See DEPLOYMENT.md → "Critical: use Session Mode (port 5432)".
+      - key: DATABASE_URL
+        sync: false
+
+      # ---- Cache / rate limiting ----------------------------------------
+      # Upstash connection URI. Use the rediss:// (TLS) form.
+      # If Redis is unreachable the rate limiter fails OPEN by design — the
+      # API keeps serving, but Denial-of-Wallet protection is off.
+      - key: REDIS_URL
+        sync: false
+
+      # ---- Auth ----------------------------------------------------------
+      # Supabase project URL, e.g. https://<project-ref>.supabase.co
+      # Not a secret — it only builds the JWKS endpoint used to verify ES256
+      # tokens — but it is project-specific, so it is set in the dashboard
+      # rather than committed.
+      - key: SUPABASE_URL
+        sync: false
+
+      # ---- CORS ----------------------------------------------------------
+      # The Vercel production origin, e.g. https://sourceguard.vercel.app
+      # The backend's allow-list is exact with no wildcards, so this must
+      # match the deployed frontend origin character for character. Set it
+      # after the first Vercel deploy; add preview URLs comma-separated.
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+
+      # ---- AI providers (optional) ---------------------------------------
+      # Leave unset to run on the deterministic, network-free mocks: the
+      # embedding service produces SHA-256-seeded unit vectors and generation
+      # yields a word-by-word mock stream. The full pipeline works without
+      # either key, which is also why CI needs no network access.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TOGETHER_API_KEY
+        sync: false
+
+      # ---- Observability (optional) --------------------------------------
+      # Tracing activates only when the flag is true AND a key is present —
+      # a key-less "enabled" would fire failing network calls on the request
+      # path. See app/services/telemetry.py.
+      - key: LANGCHAIN_TRACING_V2
+        value: "false"
+      - key: LANGSMITH_API_KEY
+        sync: false
+      - key: LANGSMITH_PROJECT
+        value: sourceguard
+
+      # ---- Non-secret configuration --------------------------------------
+      - key: ENVIRONMENT
+        value: production
+
+      # ---- Deliberately ABSENT --------------------------------------------
+      # ADMIN_DATABASE_URL and APP_DB_PASSWORD are bootstrap-only credentials
+      # carrying DDL rights (creating tables, roles, and RLS policies). They
+      # are used once, locally, by `python -m app.db.init_db` and are never
+      # needed by the running service. Granting the web service standing
+      # superuser access to run a one-time migration would hand every request
+      # handler the privileges required to drop the schema.
