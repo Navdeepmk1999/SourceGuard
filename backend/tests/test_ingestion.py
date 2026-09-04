@@ -1,6 +1,6 @@
 """Module 11: layout-aware parsing + semantic boundary enforcement."""
 
-import fitz
+import pymupdf
 import pytest
 
 from app.services.document_parser import DocumentParser
@@ -11,12 +11,12 @@ from app.services.semantic_chunker import SemanticChunker
 def make_structured_pdf() -> bytes:
     """A PDF with a title, a section heading, a paragraph, a two-item list,
     and a ruled 3x3 table - i.e. every element type the parser classifies."""
-    doc = fitz.open()
+    doc = pymupdf.open()
     page = doc.new_page()
     page.insert_text((72, 80), "Quarterly Revenue Report", fontsize=18, fontname="hebo")
     page.insert_text((72, 115), "Section 1: Regional Overview", fontsize=13, fontname="hebo")
     page.insert_textbox(
-        fitz.Rect(72, 130, 500, 180),
+        pymupdf.Rect(72, 130, 500, 180),
         "Revenue grew across all regions this quarter. "
         "The table below breaks out figures by region.",
         fontsize=10,
@@ -32,7 +32,7 @@ def make_structured_pdf() -> bytes:
     x0, y0, col_w, row_h = 72, 235, 110, 20
     for r in range(3):
         for c in range(3):
-            rect = fitz.Rect(x0 + c * col_w, y0 + r * row_h, x0 + (c + 1) * col_w, y0 + (r + 1) * row_h)
+            rect = pymupdf.Rect(x0 + c * col_w, y0 + r * row_h, x0 + (c + 1) * col_w, y0 + (r + 1) * row_h)
             page.draw_rect(rect, color=(0, 0, 0), width=0.7)
             page.insert_text((rect.x0 + 4, rect.y0 + 14), cells[r][c], fontsize=9)
 

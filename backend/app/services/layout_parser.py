@@ -21,7 +21,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 
-import fitz  # PyMuPDF
+import pymupdf
 from fastapi import HTTPException
 
 # A span is a heading if it is meaningfully larger than the document's body
@@ -86,7 +86,7 @@ def _iter_spans(blocks: list[dict]) -> Iterator[dict]:
             yield from line.get("spans", [])
 
 
-def _body_font_size(doc: fitz.Document) -> float:
+def _body_font_size(doc: pymupdf.Document) -> float:
     """The document's dominant body font size, used as the heading baseline.
 
     Uses the median of all span sizes weighted by character count, so a
@@ -106,7 +106,7 @@ def _body_font_size(doc: fitz.Document) -> float:
     return statistics.median(sizes)
 
 
-def _block_belongs_to_table(block_rect: fitz.Rect, table_rects: list[fitz.Rect]) -> bool:
+def _block_belongs_to_table(block_rect: pymupdf.Rect, table_rects: list[pymupdf.Rect]) -> bool:
     """True when a text block sits inside a detected table.
 
     Without this, every cell's text would be emitted a second time as loose
@@ -130,7 +130,7 @@ class LayoutParser:
     def parse_pdf(self, content: bytes) -> tuple[list[LayoutElement], int]:
         """Returns (elements, page_count) for a PDF."""
         try:
-            with fitz.open(stream=content, filetype="pdf") as doc:
+            with pymupdf.open(stream=content, filetype="pdf") as doc:
                 body_size = _body_font_size(doc)
                 elements: list[LayoutElement] = []
                 for page_index, page in enumerate(doc):
@@ -144,11 +144,11 @@ class LayoutParser:
             ) from exc
 
     def _parse_page(
-        self, page: fitz.Page, page_number: int, body_size: float
+        self, page: pymupdf.Page, page_number: int, body_size: float
     ) -> list[LayoutElement]:
         # Tables first: their bounding boxes determine which text blocks to
         # skip, so they must be known before any text is emitted.
-        table_rects: list[fitz.Rect] = []
+        table_rects: list[pymupdf.Rect] = []
         # (vertical position, element) so tables and text can be re-ordered
         # into true reading order below.
         positioned: list[tuple[float, LayoutElement]] = []
@@ -162,7 +162,7 @@ class LayoutParser:
             tables = []
 
         for table in tables:
-            rect = fitz.Rect(table.bbox)
+            rect = pymupdf.Rect(table.bbox)
             table_rects.append(rect)
             try:
                 markdown = table.to_markdown().strip()
@@ -184,7 +184,7 @@ class LayoutParser:
         for block in page.get_text("dict").get("blocks", []):
             if block.get("type") != 0:
                 continue
-            block_rect = fitz.Rect(block["bbox"])
+            block_rect = pymupdf.Rect(block["bbox"])
             if _block_belongs_to_table(block_rect, table_rects):
                 continue
 

@@ -1,0 +1,29 @@
+# Local virtualenv - would balloon the build context and shadow the
+# container's own site-packages if copied in.
+venv/
+.venv/
+
+# Bytecode / caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets: never bake into an image layer. Config is injected at runtime
+# via docker-compose env_file / environment.
+.env
+.env.*
+!.env.example
+
+# Test artifacts
+.coverage
+htmlcov/
+*.sqlite3
+*.db
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

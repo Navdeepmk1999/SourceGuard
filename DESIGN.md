@@ -22,7 +22,7 @@ the fixed engineering guidelines the codebase is held to, see `CLAUDE.md`.
 ## Module 1: Ingestion & Chunking (As-Built)
 
 **Parsing — `app/services/document_parser.py` (`DocumentParser`)**
-- PDF text extraction via **PyMuPDF (`fitz`)**: each page's `get_text()` output is joined with newlines; page count is returned alongside the full text.
+- PDF text extraction via **PyMuPDF** (imported as `pymupdf`; the legacy `fitz` alias is deprecated and was removed from this codebase in Module 12): each page's `get_text()` output is joined with newlines; page count is returned alongside the full text.
 - TXT files are decoded as UTF-8; a `UnicodeDecodeError` is converted into an `HTTPException(422)` rather than propagating a raw exception.
 - Supported extensions are an explicit whitelist (`SUPPORTED_SUFFIXES = {".pdf": ..., ".txt": ...}`); anything else raises `HTTPException(400)`.
 
@@ -239,11 +239,24 @@ TypeScript interfaces are hand-mirrored from the backend's Python source of trut
 - **Dependencies:** none added. `requirements.txt` annotates why `pymupdf` now carries the layout role, and `README.md` documents that **no `poppler`/`tesseract` step exists** — so there is no fallback path to provide, which was the point of choosing this strategy.
 - **Tests:** `tests/test_ingestion.py` (23 tests) across layout classification, Markdown table fidelity, table-text de-duplication, list-welding, plain-text structure, and the three boundary rules — including that an oversized table stays whole, that splits land on element boundaries, and that offsets round-trip to the source. Full suite: **114 passing**.
 
+**Module 12 — DevOps & Cloud Orchestration — ✅ Containerization + CI Implemented (IaC and hybrid deployment still planned, see below)**
+- **`backend/Dockerfile`:** `python:3.11-slim`, `requirements.txt` copied and installed *before* application code so the dependency layer is keyed only on the lockfile — editing a source file rebuilds from the `COPY . .` step rather than reinstalling every package. Runs as a non-root `appuser` (uid 10001) created *after* the pip layer so user setup can't invalidate it. `HEALTHCHECK` hits the existing `/health` route through `urllib` rather than `curl`/`wget`, neither of which exists in `-slim` — adding one purely for a healthcheck would grow the image for nothing.
+- **`frontend/Dockerfile`:** three stages — `deps` (`npm ci`, keyed on the lockfile), `builder` (`npm run build`), `runner` (standalone output only), on `node:22-alpine` with `libc6-compat` for the glibc symbols Next's precompiled binaries expect. Runs as non-root `nextjs`.
+  - `next.config.ts` now sets `output: "standalone"`, so the runtime stage ships `server.js` plus only the `node_modules` actually needed instead of the full tree.
+  - **`public/` and `.next/static/` are copied in explicitly.** Next.js deliberately omits both from standalone output (it assumes a CDN serves them) — this version's own docs call it out. Without those two `COPY` lines the app boots and then 404s every stylesheet, script chunk, and font. Verified by serving the running container and asserting a `.next/static` chunk and `public/next.svg` both return 200.
+  - **`NEXT_PUBLIC_*` are build ARGs, not runtime env.** Next inlines them into the client bundle during `next build`; supplying them only at `docker run` would silently ship a bundle with `undefined` baked in. Verified by grepping the built image and confirming both the API URL and Supabase URL are present in the emitted chunks.
+- **`docker-compose.yml`** defines `backend` and `frontend` only. **Postgres and Redis are deliberately excluded:** this project's local setup already runs them as standalone containers on 5432/6379, so declaring them again would collide on those ports and risk a second, empty database silently shadowing the real one. The services reach them over `host.docker.internal` (with an `extra_hosts: host-gateway` mapping so this also resolves on Linux, not just Docker Desktop). Verified by querying the real Postgres from inside a container.
+  - Backend config is inherited from `backend/.env` via `env_file` (marked `required: false` so compose works before the file exists), with `DATABASE_URL`/`REDIS_URL` overridden because `localhost` inside a container is the container itself, not the host.
+  - `NEXT_PUBLIC_API_URL` defaults to `http://localhost:8000/api/v1`, **not** `http://backend:8000` — that URL is fetched by the user's *browser*, which runs on the host and cannot resolve compose service names.
+  - The frontend waits on `depends_on: condition: service_healthy`, which is why the backend carries a healthcheck at all.
+- **`.github/workflows/ci.yml`** runs on push and pull_request against `main`, with a `concurrency` group that cancels superseded runs. Two jobs: **backend** (Python 3.11, pip-cached, `pytest`) and **frontend** (Node 22, npm-cached, `tsc --noEmit` + `eslint` + `next build`). No `services:` block is needed — the suite runs on in-memory SQLite with Redis faked and, with no AI keys set, the deterministic offline mocks — so CI needs no Postgres, no Redis, and no network egress.
+- **Verified by building and running, not by inspection.** Both images were built locally; the backend image ran the full suite — **114/114 passing on Python 3.11**, which also confirms 3.11 compatibility that local development (3.14) never exercises. The frontend container was started and confirmed to redirect `/` → `/login`, serve `/login` at 200, and serve both static and `public/` assets. `docker compose config` validates and resolves as intended.
+- **PyMuPDF import modernized (follow-up, now done):** the 3.11 container run surfaced `DeprecationWarning: The 'fitz' API is deprecated ... Use 'import pymupdf' instead.` Renamed `import fitz` → `import pymupdf` across `document_parser.py`, `layout_parser.py`, and the two test modules that build fixture PDFs (`test_document_processing.py`, `test_ingestion.py`) — the warning fires on the import itself, so the test files mattered as much as the services. `pymupdf.open`/`Document`/`Rect`/`Page` were confirmed to be the *same objects* as their `fitz` counterparts before renaming, so this is an alias change with no behavioral difference. Verified in the CI-equivalent 3.11 container: `python -W error::DeprecationWarning -c "import app.main"` passes, and the suite runs 114/114.
+- The one remaining warning in that container comes from `starlette/testclient.py` (`anyio.abc.BlockingPortal` alias deprecated) — third-party code, not this project's, and not suppressed.
+
 ### Phase 2 Execution Roadmap (Planned)
 
-**Module 12: DevOps & Cloud Orchestration**
-- **Containerization:** Package the FastAPI microservice into optimized Docker images for consistent cross-environment execution.
-- **Infrastructure as Code (IaC):** Write Terraform modules to provision cloud infrastructure (AWS EC2/RDS).
-- **CI/CD Pipelines:** Configure GitHub Actions to automatically execute the `pytest` suite on every push.
-- **Hybrid Deployment:** Host the Next.js application on Vercel's global Edge Network while orchestrating the backend containers through AWS.
+**Module 12 (continued): Cloud Deployment**
+- **Infrastructure as Code (IaC):** Write Terraform modules to provision cloud infrastructure (AWS EC2/RDS). Not started — the containerization and CI portions above are what shipped.
+- **Hybrid Deployment:** Host the Next.js application on Vercel's global Edge Network while orchestrating the backend containers through AWS. Not started.
 

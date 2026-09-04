@@ -1,7 +1,7 @@
 import uuid
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pymupdf
 from fastapi import HTTPException
 
 from app.schemas.document import DocumentType, ParsingResult
@@ -42,7 +42,7 @@ class DocumentParser:
     def parse_pdf_bytes(self, content: bytes) -> tuple[str, int]:
         """Extract text from raw PDF bytes. Returns (full_text, page_count)."""
         try:
-            with fitz.open(stream=content, filetype="pdf") as pdf:
+            with pymupdf.open(stream=content, filetype="pdf") as pdf:
                 pages = [page.get_text() for page in pdf]
                 return "\n".join(pages), len(pages)
         except Exception as exc:

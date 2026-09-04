@@ -12,3 +12,4 @@ backend/.env
 .DS_Store
 **/__pycache__/
 graphify-out/
+.env

@@ -99,6 +99,90 @@ boundaries rather than character counts: tables stay atomic, headings bind
 to the content they introduce, and splits land between elements rather than
 mid-sentence.
 
+## Running with Docker
+
+Postgres and Redis are **not** part of `docker-compose.yml` — the local setup
+already runs them as standalone containers on the standard ports, and
+declaring them again would collide on 5432/6379. Start them first (see
+[Prerequisites](#prerequisites)), then:
+
+```bash
+# From the repo root
+docker compose up --build
+```
+
+- Frontend → http://localhost:3000
+- Backend → http://localhost:8000 (health at `/health`)
+
+The backend waits for its own healthcheck before the frontend starts
+(`depends_on: condition: service_healthy`).
+
+### Configuration
+
+The backend inherits `backend/.env` via `env_file`, so Supabase, Groq,
+Together, and LangSmith settings carry over unchanged. Two values are
+overridden in compose because they differ inside a container:
+
+| Variable | Why it's overridden |
+| --- | --- |
+| `DATABASE_URL` | `localhost` inside a container is the container itself, not the host running Postgres — rewritten to `host.docker.internal`. |
+| `REDIS_URL` | Same reason. |
+
+Override either by exporting it (or putting it in a root `.env`) before
+`docker compose up` — e.g. to point at managed Supabase/Upstash instances.
+
+**`NEXT_PUBLIC_*` are build-time, not runtime.** Next.js inlines them into
+the client bundle during `npm run build`, so they are passed as **build
+args**, not environment variables. Setting them only at `docker run` time
+silently produces a bundle with `undefined` baked in.
+
+```bash
+export NEXT_PUBLIC_SUPABASE_URL=https://<ref>.supabase.co
+export NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<publishable-key>
+docker compose up --build     # values are read into the frontend build args
+```
+
+Note that `NEXT_PUBLIC_API_URL` defaults to `http://localhost:8000/api/v1`,
+**not** `http://backend:8000`. That URL is fetched by the user's browser,
+which runs on the host and cannot resolve compose service names; `backend`
+resolves only between containers.
+
+### Building images individually
+
+```bash
+docker build -t sourceguard-backend ./backend
+
+docker build -t sourceguard-frontend ./frontend \
+  --build-arg NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1 \
+  --build-arg NEXT_PUBLIC_SUPABASE_URL=https://<ref>.supabase.co \
+  --build-arg NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<publishable-key>
+```
+
+Both images run as non-root. The frontend uses Next.js standalone output, so
+the runtime stage ships only `server.js` plus the modules it actually needs
+(`public/` and `.next/static/` are copied in explicitly — standalone omits
+them by design).
+
+You can run the test suite in the same Python version CI uses:
+
+```bash
+docker build -t sourceguard-backend ./backend
+docker run --rm sourceguard-backend python -m pytest -q
+```
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request against
+`main`:
+
+- **backend** — Python 3.11, `pip install -r requirements.txt`, `pytest`
+- **frontend** — Node 22, `npm ci`, `tsc --noEmit`, `eslint`, `next build`
+
+No service containers are needed: the backend suite runs against in-memory
+SQLite with Redis faked, and with no AI provider keys set the embedding and
+generation services fall back to their deterministic offline mocks — so CI
+requires no Postgres, no Redis, and no network egress.
+
 ## Tests
 
 ```bash

@@ -1,4 +1,4 @@
-import fitz
+import pymupdf
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -11,7 +11,7 @@ from app.services.document_parser import DocumentParser
 
 def make_pdf_bytes(pages_text: list[str]) -> bytes:
     """Builds an in-memory PDF with one page per string in `pages_text`."""
-    doc = fitz.open()
+    doc = pymupdf.open()
     for text in pages_text:
         page = doc.new_page()
         page.insert_text((72, 72), text)
