@@ -15,15 +15,20 @@ ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 # `create_all` will not alter an existing VECTOR(n) column, so the table must
 # be dropped and recreated and every document re-ingested.
 #
-# 3072 is the NATIVE output width of gemini-embedding-001.
+# 3072 is the native output width of gemini-embedding-001, and what Gemini's
+# OpenAI-compatibility layer returns by default.
 #
-# Matryoshka truncation to 768 or 1536 is reachable only by sending a
-# `dimensions` field on the request, and Gemini's OpenAI-compatibility layer
-# rejects that field with 400 Bad Request. The native width is therefore what
-# the API returns, and this constant must match it. See the NOTE in
-# embeddings.py::embed_batch before attempting to shrink this again.
+# A narrower Matryoshka width (1536 or 768) cannot be requested through that
+# layer: it rejects the `dimensions` field with 400 Bad Request. So whatever
+# the endpoint returns natively is what the column must be sized for. See the
+# NOTE in embeddings.py::_embed_one.
 #
-# The width check in embed_batch still guards this: a mismatch raises a 502
+# NOTE: 3072 exceeds pgvector's 2000-dimension ceiling for ivfflat and hnsw
+# indexes on the `vector` type. No vector index is defined today (retrieval is
+# a sequential scan), so nothing breaks - but adding ANN indexing later would
+# require the `halfvec` type, which indexes up to 4000 dimensions.
+#
+# The width check in embed_batch guards this constant: a mismatch raises a 502
 # naming the actual width rather than persisting a wrong-width vector that
 # would fail at INSERT or silently poison search.
 EMBEDDING_DIMENSIONS = 3072

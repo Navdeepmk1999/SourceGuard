@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 import struct
@@ -9,6 +10,10 @@ from fastapi import HTTPException
 from app.core.config import EMBEDDING_DIMENSIONS, Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+# Caps in-flight embedding requests. Gemini requires one text per request,
+# so a 500-chunk document would otherwise fire 500 concurrent calls.
+_MAX_CONCURRENT_EMBEDDING_REQUESTS = 8
 
 
 class EmbeddingService:
@@ -41,6 +46,17 @@ class EmbeddingService:
         return results[0]
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embeds each text in its own request, concurrently.
+
+        Gemini's OpenAI-compatibility layer returns 400 Bad Request when
+        "input" is a list, so the batching the endpoint would normally do is
+        performed here instead: one request per text, issued concurrently and
+        recombined.
+
+        `asyncio.gather` preserves argument order, which is load-bearing - the
+        caller zips these vectors back onto chunks by position, so a reordered
+        result would silently attach every embedding to the wrong chunk.
+        """
         if not texts:
             return []
 
@@ -48,43 +64,23 @@ class EmbeddingService:
             return [self._mock_embedding(text) for text in texts]
 
         client = await self._get_client()
-        try:
-            response = await client.post(
-                "/embeddings",
-                # NOTE: do not add a "dimensions" field here. Gemini's
-                # OpenAI-compatibility layer returns 400 Bad Request when it is
-                # present, so the vector width is whatever the model natively
-                # emits and EMBEDDING_DIMENSIONS must be set to match it.
-                json={"model": self._settings.embedding_model, "input": texts},
-                headers={"Authorization": f"Bearer {self._settings.together_api_key}"},
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            # Logged in full server-side because a 400 here most likely means
-            # the provider's OpenAI-compatibility layer rejected `dimensions`;
-            # the client only needs to know the upstream call failed.
-            logger.error(
-                "Embedding API request failed (model=%s, dimensions=%s): %r",
-                self._settings.embedding_model,
-                EMBEDDING_DIMENSIONS,
-                exc,
-            )
-            raise HTTPException(status_code=502, detail=f"Embedding API request failed: {exc}") from exc
-
-        payload = response.json()
-        embeddings = [item["embedding"] for item in payload.get("data", [])]
+        # Bounded so that ingesting a large document does not open one
+        # connection per chunk at once, which would exhaust the pool and draw
+        # 429s from the provider. Concurrency still hides most of the latency.
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_EMBEDDING_REQUESTS)
+        embeddings = await asyncio.gather(
+            *(self._embed_one(client, text, semaphore) for text in texts)
+        )
 
         for embedding in embeddings:
             if len(embedding) != EMBEDDING_DIMENSIONS:
-                # The provider ignored the requested width. Name the remedy in
-                # the log: the pgvector column width is set at DDL time, so
-                # realigning means editing EMBEDDING_DIMENSIONS *and*
-                # recreating document_chunks - create_all will not alter it.
+                # The pgvector column width is fixed at DDL time, so realigning
+                # means editing EMBEDDING_DIMENSIONS *and* recreating
+                # document_chunks - create_all will not alter an existing
+                # VECTOR(n) column.
                 logger.error(
                     "Embedding width mismatch: %s returned %d dimensions, expected %d. "
-                    "The provider ignored the requested `dimensions`. Either use an "
-                    "endpoint that honors it, or set EMBEDDING_DIMENSIONS=%d and "
-                    "recreate the document_chunks table.",
+                    "Set EMBEDDING_DIMENSIONS=%d and recreate the document_chunks table.",
                     self._settings.embedding_model,
                     len(embedding),
                     EMBEDDING_DIMENSIONS,
@@ -98,7 +94,45 @@ class EmbeddingService:
                     ),
                 )
 
-        return embeddings
+        return list(embeddings)
+
+    async def _embed_one(
+        self, client: httpx.AsyncClient, text: str, semaphore: asyncio.Semaphore
+    ) -> list[float]:
+        """Embeds a single string. One text per request - see `embed_batch`."""
+        async with semaphore:
+            try:
+                response = await client.post(
+                    "/embeddings",
+                    # NOTE: two constraints of Gemini's OpenAI-compatibility
+                    # layer are encoded here, both of which return 400 if
+                    # violated: "input" must be a single string, never a list,
+                    # and no "dimensions" field may be sent.
+                    json={"model": self._settings.embedding_model, "input": text},
+                    headers={"Authorization": f"Bearer {self._settings.together_api_key}"},
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                # Logged in full server-side; the client only needs to know the
+                # upstream call failed.
+                logger.error(
+                    "Embedding API request failed (model=%s): %r",
+                    self._settings.embedding_model,
+                    exc,
+                )
+                raise HTTPException(
+                    status_code=502, detail=f"Embedding API request failed: {exc}"
+                ) from exc
+
+        payload = response.json()
+        try:
+            return payload["data"][0]["embedding"]
+        except (KeyError, IndexError, TypeError) as exc:
+            # A 200 with an unexpected shape would otherwise surface as a 500.
+            logger.error("Embedding API returned an unexpected payload shape: %r", payload)
+            raise HTTPException(
+                status_code=502, detail="Embedding API returned a malformed response"
+            ) from exc
 
     @staticmethod
     def _mock_embedding(text: str) -> list[float]:

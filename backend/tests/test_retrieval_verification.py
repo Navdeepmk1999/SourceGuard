@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from unittest.mock import AsyncMock
@@ -299,6 +300,7 @@ class TestEmbeddingServiceLiveRequest:
         embedding = await service.embed("hello")
 
         assert "dimensions" not in captured, "Gemini returns 400 when `dimensions` is sent"
+        assert isinstance(captured["input"], str), "Gemini returns 400 when `input` is a list"
         assert captured["model"] == "gemini-embedding-001"
         assert len(embedding) == EMBEDDING_DIMENSIONS
 
@@ -333,4 +335,92 @@ class TestEmbeddingServiceLiveRequest:
         with pytest.raises(HTTPException) as exc:
             await service.embed("hello")
 
+        assert exc.value.status_code == 502
+
+
+class TestEmbeddingBatchFanOut:
+    """Gemini rejects a list `input`, so batching is done client-side.
+
+    That turns one call into N, which makes two properties load-bearing:
+    every request must carry a single string, and the returned vectors must
+    stay in the caller's order - chunks are matched to embeddings by position,
+    so a reordered result would attach each vector to the wrong chunk without
+    raising anything.
+    """
+
+    @staticmethod
+    def _service(handler) -> EmbeddingService:
+        settings = get_settings().model_copy(
+            update={"together_api_key": "test-key", "embedding_model": "gemini-embedding-001"}
+        )
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="https://example.invalid/v1"
+        )
+        return EmbeddingService(settings=settings, client=client)
+
+    async def test_one_request_per_text_each_with_a_string_input(self):
+        seen: list = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            seen.append(body["input"])
+            return httpx.Response(
+                200, json={"data": [{"embedding": [0.1] * EMBEDDING_DIMENSIONS}]}
+            )
+
+        service = self._service(handler)
+        texts = ["alpha", "beta", "gamma", "delta"]
+        results = await service.embed_batch(texts)
+
+        assert len(seen) == len(texts), "expected one request per text"
+        assert all(isinstance(i, str) for i in seen), "`input` must never be a list"
+        assert sorted(seen) == sorted(texts)
+        assert len(results) == len(texts)
+
+    async def test_results_keep_caller_order_despite_concurrency(self):
+        """Slow-first responses must not reorder the returned vectors."""
+        order = {"alpha": 0, "beta": 1, "gamma": 2, "delta": 3}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            text = json.loads(request.content)["input"]
+            # Invert completion order relative to submission order.
+            await asyncio.sleep((len(order) - order[text]) * 0.01)
+            vector = [float(order[text])] * EMBEDDING_DIMENSIONS
+            return httpx.Response(200, json={"data": [{"embedding": vector}]})
+
+        service = self._service(handler)
+        results = await service.embed_batch(list(order))
+
+        assert [r[0] for r in results] == [0.0, 1.0, 2.0, 3.0]
+
+    async def test_empty_input_makes_no_requests(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no request should be sent for an empty batch")
+
+        assert await self._service(handler).embed_batch([]) == []
+
+    async def test_malformed_payload_is_502_not_500(self):
+        """A 200 with an unexpected shape must not surface as an unhandled error."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": []})
+
+        with pytest.raises(HTTPException) as exc:
+            await self._service(handler).embed("hello")
+        assert exc.value.status_code == 502
+
+    async def test_one_failing_request_fails_the_batch(self):
+        """Fail fast: a partial batch would persist chunks with no embedding."""
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                return httpx.Response(500, json={"error": "upstream exploded"})
+            return httpx.Response(
+                200, json={"data": [{"embedding": [0.1] * EMBEDDING_DIMENSIONS}]}
+            )
+
+        with pytest.raises(HTTPException) as exc:
+            await self._service(handler).embed_batch(["a", "b", "c"])
         assert exc.value.status_code == 502
