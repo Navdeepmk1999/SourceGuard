@@ -68,10 +68,8 @@ class DocumentParser:
             )
         return filename
 
-    def parse(self, filename: str, content: bytes) -> ParsingResult:
-        """Parse a document (by filename extension) and chunk it into a ParsingResult."""
-        filename = self._validate_filename(filename)
-
+    def detect_type(self, filename: str) -> DocumentType:
+        """Maps a filename to its DocumentType, or raises 400."""
         suffix = Path(filename).suffix.lower()
         document_type = SUPPORTED_SUFFIXES.get(suffix)
         if document_type is None:
@@ -79,6 +77,26 @@ class DocumentParser:
                 status_code=400,
                 detail=f"Unsupported document type '{suffix}'. Supported: {list(SUPPORTED_SUFFIXES)}",
             )
+        return document_type
+
+    def validate_upload(self, filename: str, content: bytes) -> str:
+        """Runs the cheap, synchronous checks and returns the safe filename.
+
+        Split out from `parse` because ingestion is now asynchronous: these
+        checks must still run inside the request so a bad filename or an
+        unsupported type is a 400 the uploader sees immediately, rather than a
+        'failed' row they have to go hunting for afterwards.
+        """
+        safe_name = self._validate_filename(filename)
+        self.detect_type(safe_name)
+        if not content:
+            raise HTTPException(status_code=400, detail=f"File '{safe_name}' is empty")
+        return safe_name
+
+    def parse(self, filename: str, content: bytes) -> ParsingResult:
+        """Parse a document (by filename extension) and chunk it into a ParsingResult."""
+        filename = self._validate_filename(filename)
+        document_type = self.detect_type(filename)
 
         total_pages: int | None = None
         if document_type == DocumentType.PDF:

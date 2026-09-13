@@ -8,8 +8,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { ApiError, createWorkspace, getWorkspaces } from "@/lib/api";
-import type { Workspace } from "@/types";
+import { ApiError, createWorkspace, deleteWorkspace, getWorkspaces } from "@/lib/api";
+import type { DeletionResult, Workspace } from "@/types";
 
 interface WorkspaceContextValue {
   workspaces: Workspace[];
@@ -19,6 +19,11 @@ interface WorkspaceContextValue {
   fetchWorkspaces: () => Promise<void>;
   /** Returns the created workspace, or `null` if the request failed. */
   addWorkspace: (name: string) => Promise<Workspace | null>;
+  /**
+   * Deletes a workspace and everything beneath it. Returns the cascade
+   * counts, or `null` if the request failed.
+   */
+  removeWorkspace: (workspaceId: string) => Promise<DeletionResult | null>;
   setActiveWorkspace: (workspace: Workspace | null) => void;
 }
 
@@ -69,6 +74,32 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const removeWorkspace = useCallback(async (workspaceId: string) => {
+    setError(null);
+    try {
+      const result = await deleteWorkspace(workspaceId);
+
+      setWorkspaces((current) => current.filter((workspace) => workspace.id !== workspaceId));
+      // Clear the selection if the deleted workspace was the active one -
+      // leaving it selected would leave the chat panel and document list
+      // pointed at a workspace the server no longer has.
+      setActiveWorkspace((current) => (current?.id === workspaceId ? null : current));
+
+      return result;
+    } catch (cause) {
+      // A 404 means it is already gone (deleted in another tab). Reconcile
+      // local state to match rather than reporting an error for something
+      // the user was trying to achieve anyway.
+      if (cause instanceof ApiError && cause.status === 404) {
+        setWorkspaces((current) => current.filter((workspace) => workspace.id !== workspaceId));
+        setActiveWorkspace((current) => (current?.id === workspaceId ? null : current));
+        return { id: workspaceId, deleted_documents: 0, deleted_chunks: 0 };
+      }
+      setError(toMessage(cause));
+      return null;
+    }
+  }, []);
+
   const value = useMemo<WorkspaceContextValue>(
     () => ({
       workspaces,
@@ -77,9 +108,18 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       error,
       fetchWorkspaces,
       addWorkspace,
+      removeWorkspace,
       setActiveWorkspace,
     }),
-    [workspaces, activeWorkspace, isLoading, error, fetchWorkspaces, addWorkspace]
+    [
+      workspaces,
+      activeWorkspace,
+      isLoading,
+      error,
+      fetchWorkspaces,
+      addWorkspace,
+      removeWorkspace,
+    ]
   );
 
   return (

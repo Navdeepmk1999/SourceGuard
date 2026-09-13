@@ -47,9 +47,21 @@ export async function proxy(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
 
-  const isLoginPage = request.nextUrl.pathname.startsWith("/login");
+  const { pathname } = request.nextUrl;
+  const isLoginPage = pathname.startsWith("/login");
 
-  if (!user && !isLoginPage) {
+  // Reachable without a session, or the password-reset flow is impossible:
+  // a user who has forgotten their password is by definition signed out, so
+  // redirecting them to /login would trap them in a loop.
+  //
+  // /reset-password is listed for the opposite reason. Supabase exchanges the
+  // emailed recovery token for a real session, so the visitor arrives
+  // authenticated - and would be bounced to the dashboard before they could
+  // choose a new password.
+  const isPasswordResetFlow =
+    pathname.startsWith("/forgot-password") || pathname.startsWith("/reset-password");
+
+  if (!user && !isLoginPage && !isPasswordResetFlow) {
     const loginUrl = request.nextUrl.clone();
     loginUrl.pathname = "/login";
     return NextResponse.redirect(loginUrl);

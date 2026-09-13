@@ -1,13 +1,13 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import ensure_workspace_owner, get_authenticated_db, get_current_user
 from app.models import Document, DocumentChunk, Workspace
-from app.schemas.document import DocumentRead
+from app.schemas.document import DeletionResult, DocumentRead
 from app.schemas.workspace import WorkspaceCreate, WorkspaceRead
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["workspaces"])
@@ -83,3 +83,42 @@ async def create_workspace(
 
     await session.refresh(workspace)
     return workspace
+
+
+@router.delete("/{workspace_id}", response_model=DeletionResult)
+async def delete_workspace(
+    workspace_id: uuid.UUID,
+    session: AsyncSession = Depends(get_authenticated_db),
+    user_id: uuid.UUID = Depends(get_current_user),
+) -> DeletionResult:
+    """Deletes a workspace and everything beneath it.
+
+    Documents, chunks, chat sessions, and chat messages all disappear via
+    ON DELETE CASCADE on their foreign keys - one statement in the database
+    rather than loading every chunk into the session to delete it.
+
+    Counts are gathered first, and returned, because the blast radius is
+    otherwise invisible: the caller asked to delete one workspace and may have
+    destroyed thousands of embeddings.
+    """
+    workspace = await session.get(Workspace, workspace_id)
+    ensure_workspace_owner(workspace, user_id)
+
+    document_count = await session.scalar(
+        select(func.count()).select_from(Document).where(Document.workspace_id == workspace_id)
+    )
+    chunk_count = await session.scalar(
+        select(func.count())
+        .select_from(DocumentChunk)
+        .join(Document, DocumentChunk.document_id == Document.id)
+        .where(Document.workspace_id == workspace_id)
+    )
+
+    await session.execute(delete(Workspace).where(Workspace.id == workspace_id))
+    await session.commit()
+
+    return DeletionResult(
+        id=workspace_id,
+        deleted_documents=document_count or 0,
+        deleted_chunks=chunk_count or 0,
+    )

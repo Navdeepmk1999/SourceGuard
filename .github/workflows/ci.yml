@@ -68,6 +68,11 @@ jobs:
       - name: Lint
         run: npx eslint .
 
+      - name: Test
+        # Runs before the build: a failing component test should stop the job
+        # at the cheaper step rather than after a full Next.js compile.
+        run: npm test
+
       - name: Build
         # NEXT_PUBLIC_* are inlined at build time. These are throwaway values
         # that only need to be present for the build to produce a bundle;

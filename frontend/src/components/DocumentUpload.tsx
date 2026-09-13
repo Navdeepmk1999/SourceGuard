@@ -5,6 +5,7 @@ import { Loader2, Upload } from "lucide-react";
 import { useWorkspaces } from "@/context/WorkspaceContext";
 import { ApiError, uploadDocument } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useIngestionStatus } from "@/hooks/useIngestionStatus";
 
 interface Toast {
   id: number;
@@ -17,6 +18,21 @@ const TOAST_DURATION_MS = 5000;
 export function DocumentUpload() {
   const { activeWorkspace } = useWorkspaces();
   const [isUploading, setIsUploading] = useState(false);
+
+  // Reports the outcome once ingestion actually finishes. The upload toast
+  // can only say "queued" - the real result arrives minutes later.
+  const { track } = useIngestionStatus((status) => {
+    if (status.status === "completed") {
+      pushToast(
+        "success",
+        `"${status.filename}" ingested — ${status.chunk_count} chunk${
+          status.chunk_count === 1 ? "" : "s"
+        }.`
+      );
+    } else {
+      pushToast("error", status.error_message ?? `"${status.filename}" failed to ingest.`);
+    }
+  });
   const [toasts, setToasts] = useState<Toast[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const nextToastId = useRef(0);
@@ -40,15 +56,16 @@ export function DocumentUpload() {
     setIsUploading(true);
     try {
       const result = await uploadDocument(activeWorkspace.id, file);
-      const summary = result.documents[0];
-      pushToast(
-        "success",
-        summary
-          ? `"${summary.filename}" ingested — ${summary.total_chunks} chunk${
-              summary.total_chunks === 1 ? "" : "s"
-            }.`
-          : `"${file.name}" uploaded.`
-      );
+      const accepted = result.documents[0];
+      if (accepted) {
+        // 202: queued, not ingested. No chunk count exists yet, so the toast
+        // must not claim one - the tracker reports completion when polling
+        // sees a terminal status.
+        track(accepted.document_id);
+        pushToast("success", `"${accepted.filename}" queued for ingestion…`);
+      } else {
+        pushToast("success", `"${file.name}" uploaded.`);
+      }
     } catch (cause) {
       pushToast(
         "error",
