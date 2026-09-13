@@ -1,4 +1,6 @@
+import uuid
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -52,6 +54,32 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency yielding a request-scoped async DB session."""
     async with AsyncSessionLocal() as session:
         try:
+            yield session
+        finally:
+            await _clear_tenant_context(session)
+
+
+@asynccontextmanager
+async def tenant_session(user_id: uuid.UUID) -> AsyncGenerator[AsyncSession, None]:
+    """A session with the RLS tenant context set, for work outside a request.
+
+    `get_authenticated_db` cannot be reused by a background task: it is a
+    FastAPI dependency whose session is closed - and whose tenant context is
+    cleared - as soon as the response is sent. A task that outlives the
+    response would otherwise write with no tenant set, and every INSERT would
+    be rejected by the RLS policies it is supposed to be governed by.
+
+    Mirrors the request path exactly: session scope (`false`), because
+    ingestion commits several times, and a transaction-scoped setting is
+    discarded at each commit.
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                await session.execute(
+                    text("SELECT set_config(:name, :user_id, false)"),
+                    {"name": TENANT_SETTING, "user_id": str(user_id)},
+                )
             yield session
         finally:
             await _clear_tenant_context(session)

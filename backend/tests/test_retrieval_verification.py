@@ -277,7 +277,12 @@ class TestEmbeddingServiceLiveRequest:
         client = httpx.AsyncClient(
             transport=httpx.MockTransport(handler), base_url="https://example.invalid/v1"
         )
-        return EmbeddingService(settings=settings, client=client)
+        # Zero intervals: the pacing and backoff *policy* is asserted
+        # separately; making every test wait 4s per request would add minutes
+        # to the suite and test asyncio.sleep rather than this code.
+        return EmbeddingService(
+            settings=settings, client=client, min_request_interval=0, base_retry_delay=0
+        )
 
     async def test_request_omits_the_dimensions_field(self):
         """Gemini 400s if `dimensions` is present - regression guard.
@@ -356,7 +361,12 @@ class TestEmbeddingBatchFanOut:
         client = httpx.AsyncClient(
             transport=httpx.MockTransport(handler), base_url="https://example.invalid/v1"
         )
-        return EmbeddingService(settings=settings, client=client)
+        # Zero intervals: the pacing and backoff *policy* is asserted
+        # separately; making every test wait 4s per request would add minutes
+        # to the suite and test asyncio.sleep rather than this code.
+        return EmbeddingService(
+            settings=settings, client=client, min_request_interval=0, base_retry_delay=0
+        )
 
     async def test_one_request_per_text_each_with_a_string_input(self):
         seen: list = []
@@ -424,3 +434,115 @@ class TestEmbeddingBatchFanOut:
         with pytest.raises(HTTPException) as exc:
             await self._service(handler).embed_batch(["a", "b", "c"])
         assert exc.value.status_code == 502
+
+
+class TestEmbeddingRateLimitHandling:
+    """Gemini's free tier allows 15 requests/minute and 429s beyond it.
+
+    One text per request means a single document can exceed that on its own,
+    so a 429 has to pause and retry rather than fail the upload.
+    """
+
+    @staticmethod
+    def _service(handler, **kwargs) -> EmbeddingService:
+        settings = get_settings().model_copy(
+            update={"together_api_key": "test-key", "embedding_model": "gemini-embedding-001"}
+        )
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="https://example.invalid/v1"
+        )
+        kwargs.setdefault("min_request_interval", 0)
+        kwargs.setdefault("base_retry_delay", 0)
+        return EmbeddingService(settings=settings, client=client, **kwargs)
+
+    async def test_429_is_retried_and_eventually_succeeds(self):
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return httpx.Response(429, json={"error": "rate limit"})
+            return httpx.Response(
+                200, json={"data": [{"embedding": [0.1] * EMBEDDING_DIMENSIONS}]}
+            )
+
+        embedding = await self._service(handler).embed("hello")
+        assert calls["n"] == 3, "expected two retries then success"
+        assert len(embedding) == EMBEDDING_DIMENSIONS
+
+    async def test_one_rate_limited_chunk_does_not_fail_the_batch(self):
+        """The whole point: a 429 on one chunk must not abort the upload."""
+        seen: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            text = json.loads(request.content)["input"]
+            seen[text] = seen.get(text, 0) + 1
+            if text == "beta" and seen[text] == 1:
+                return httpx.Response(429, json={"error": "rate limit"})
+            return httpx.Response(
+                200, json={"data": [{"embedding": [0.1] * EMBEDDING_DIMENSIONS}]}
+            )
+
+        results = await self._service(handler).embed_batch(["alpha", "beta", "gamma"])
+        assert len(results) == 3
+        assert seen["beta"] == 2, "the rate-limited chunk should have been retried"
+
+    async def test_persistent_429_eventually_gives_up_as_502(self):
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(429, json={"error": "rate limit"})
+
+        with pytest.raises(HTTPException) as exc:
+            await self._service(handler).embed("hello")
+        assert exc.value.status_code == 502
+        assert calls["n"] > 1, "should have retried before giving up"
+
+    async def test_non_429_errors_are_not_retried(self):
+        """A 400 is deterministic - retrying burns quota and delays the error."""
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(400, json={"error": "bad request"})
+
+        with pytest.raises(HTTPException) as exc:
+            await self._service(handler).embed("hello")
+        assert exc.value.status_code == 502
+        assert calls["n"] == 1, "a 400 must not be retried"
+
+    async def test_retry_after_header_is_honoured(self):
+        service = self._service(lambda r: httpx.Response(200), base_retry_delay=999)
+        response = httpx.Response(429, headers={"Retry-After": "7"})
+        assert service._retry_delay(response, attempt=0) == 7.0
+
+    async def test_backoff_grows_and_is_jittered(self):
+        service = self._service(lambda r: httpx.Response(200), base_retry_delay=2)
+        response = httpx.Response(429)
+        first = service._retry_delay(response, attempt=0)
+        third = service._retry_delay(response, attempt=2)
+        assert 2 <= first < 3, "base delay plus proportional jitter"
+        assert 8 <= third < 12, "exponential growth plus proportional jitter"
+        assert third > first, "backoff must grow with attempt"
+
+    async def test_zero_base_delay_produces_no_wait(self):
+        """Jitter must scale with the delay, not be a flat addend.
+
+        A flat jitter term would keep retries sleeping even when backoff is
+        configured to zero, which is what makes these tests fast.
+        """
+        service = self._service(lambda r: httpx.Response(200), base_retry_delay=0)
+        assert service._retry_delay(httpx.Response(429), attempt=3) == 0
+
+    async def test_pacer_spaces_request_starts(self):
+        """The pacer, not the semaphore, is what bounds the request rate."""
+        from app.services.embeddings import _RequestPacer
+
+        pacer = _RequestPacer(0.05)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        await asyncio.gather(*(pacer.wait() for _ in range(4)))
+        elapsed = loop.time() - start
+        # Four starts spaced 0.05s apart: the first is immediate, so >= 0.15s.
+        assert elapsed >= 0.15, f"expected pacing, took only {elapsed:.3f}s"

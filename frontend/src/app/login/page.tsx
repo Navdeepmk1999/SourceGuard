@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { ShieldCheck } from "lucide-react";
@@ -166,6 +167,15 @@ export default function LoginPage() {
                 ? "Log In"
                 : "Sign Up"}
           </button>
+
+          {mode === "login" ? (
+            <Link
+              href="/forgot-password"
+              className="text-center text-sm text-zinc-400 transition-colors hover:text-zinc-200"
+            >
+              Forgot your password?
+            </Link>
+          ) : null}
         </form>
       </div>
     </div>

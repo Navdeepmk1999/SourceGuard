@@ -68,3 +68,40 @@ export interface VerificationResult {
   overall_score: number;
   is_fully_supported: boolean;
 }
+
+/** Ingestion lifecycle. `completed` and `failed` are terminal — stop polling. */
+export type DocumentStatus = "pending" | "processing" | "completed" | "failed";
+
+export const TERMINAL_STATUSES: readonly DocumentStatus[] = ["completed", "failed"];
+
+/** One file accepted for background ingestion. Carries no counts — nothing is parsed yet. */
+export interface DocumentAccepted {
+  document_id: string;
+  filename: string;
+  status: DocumentStatus;
+  status_url: string;
+}
+
+/** 202 body from `POST /documents/upload`: queued, not done. */
+export interface DocumentUploadAccepted {
+  workspace_id: string;
+  documents: DocumentAccepted[];
+}
+
+/** Polling response from `GET /documents/{id}/status`. */
+export interface DocumentStatusRead {
+  id: string;
+  filename: string;
+  status: DocumentStatus;
+  chunk_count: number;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** What a DELETE removed. Counts make cascade deletion visible to the user. */
+export interface DeletionResult {
+  id: string;
+  deleted_documents: number;
+  deleted_chunks: number;
+}

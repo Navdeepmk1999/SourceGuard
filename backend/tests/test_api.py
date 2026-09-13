@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.deps import get_current_user, get_hybrid_retriever, get_redis_client
@@ -65,6 +66,17 @@ class _StubRetriever:
 @pytest_asyncio.fixture
 async def db_engine():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+
+    # SQLite ignores ON DELETE CASCADE unless foreign keys are enabled per
+    # connection. Without this the deletion endpoints - which rely on the FK
+    # cascade rather than loading every chunk into the session - would appear
+    # to work while leaving orphaned rows behind, and the cascade tests would
+    # pass vacuously. Postgres enforces FKs unconditionally.
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield engine
@@ -232,7 +244,14 @@ class TestWorkspaceDocuments:
         by_filename = {doc["filename"]: doc for doc in body}
 
         report = by_filename["report.pdf"]
-        assert set(report.keys()) == {"id", "filename", "document_type", "created_at", "total_chunks"}
+        assert set(report.keys()) == {
+            "id",
+            "filename",
+            "document_type",
+            "created_at",
+            "total_chunks",
+            "status",
+        }
         assert uuid.UUID(report["id"])
         assert report["document_type"] == "pdf"
         assert report["total_chunks"] == 2
@@ -253,12 +272,19 @@ class TestDocumentUpload:
             files=[("files", ("note.txt", b"Hello world, this is a test document.", "text/plain"))],
         )
 
-        assert response.status_code == 201
+        # 202, not 201: ingestion is now asynchronous, so nothing has been
+        # parsed or embedded by the time this returns.
+        assert response.status_code == 202
         body = response.json()
         assert body["workspace_id"] == workspace_id
         assert len(body["documents"]) == 1
-        assert body["documents"][0]["filename"] == "note.txt"
-        assert body["documents"][0]["total_chunks"] >= 1
+
+        accepted = body["documents"][0]
+        assert accepted["filename"] == "note.txt"
+        assert accepted["status"] == "pending"
+        assert accepted["status_url"] == f"/api/v1/documents/{accepted['document_id']}/status"
+        # Deliberately absent: no chunk or page counts exist yet.
+        assert "total_chunks" not in accepted
 
     async def test_upload_rejects_invalid_extension(self, client):
         ws_resp = await client.post("/api/v1/workspaces", json={"name": "Reject Co"})
@@ -577,3 +603,204 @@ class TestConversationMemory:
             },
         )
         assert response.status_code == 404
+
+
+class TestAsyncIngestion:
+    """Upload is 202 + poll. These cover the contract and the task itself."""
+
+    @staticmethod
+    def _factory(session_maker):
+        """Binds ingestion to the test engine.
+
+        A background task builds its own session outside the request, so it
+        never passes through FastAPI's dependency overrides. Without this seam
+        the task would silently run against whatever DATABASE_URL the
+        environment holds - which is how a test suite ends up quietly talking
+        to a real database.
+        """
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def factory(_user_id):
+            async with session_maker() as session:
+                yield session
+
+        return factory
+
+    async def _workspace_with_pending_doc(self, client, session_maker, filename="note.txt"):
+        ws = await client.post("/api/v1/workspaces", json={"name": f"WS {uuid.uuid4()}"})
+        workspace_id = ws.json()["id"]
+        resp = await client.post(
+            "/api/v1/documents/upload",
+            data={"workspace_id": workspace_id},
+            files=[("files", (filename, b"Hello world. This is a test document body.", "text/plain"))],
+        )
+        assert resp.status_code == 202
+        return workspace_id, resp.json()["documents"][0]["document_id"]
+
+    async def test_status_endpoint_reports_pending_before_ingestion(self, client, session_maker):
+        _, document_id = await self._workspace_with_pending_doc(client, session_maker)
+
+        resp = await client.get(f"/api/v1/documents/{document_id}/status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "pending"
+        assert body["chunk_count"] == 0
+        assert body["error_message"] is None
+
+    async def test_ingestion_completes_and_persists_chunks(self, client, session_maker):
+        from app.services.ingestion import ingest_document
+
+        _, document_id = await self._workspace_with_pending_doc(client, session_maker)
+
+        await ingest_document(
+            uuid.UUID(document_id),
+            _TEST_USER_ID,
+            "note.txt",
+            b"Hello world. This is a test document body.",
+            session_factory=self._factory(session_maker),
+        )
+
+        resp = await client.get(f"/api/v1/documents/{document_id}/status")
+        body = resp.json()
+        assert body["status"] == "completed", body
+        assert body["chunk_count"] >= 1
+        assert body["error_message"] is None
+
+    async def test_failed_ingestion_is_recorded_not_swallowed(self, client, session_maker):
+        """A background task has no caller, so a failure must land on the row.
+
+        Otherwise the exception vanishes into the event loop and the document
+        sits at 'processing' forever with nothing to explain it.
+        """
+        from app.services.ingestion import ingest_document
+
+        _, document_id = await self._workspace_with_pending_doc(client, session_maker)
+
+        await ingest_document(
+            uuid.UUID(document_id),
+            _TEST_USER_ID,
+            "note.txt",
+            b"%PDF-1.4 not actually a valid pdf",  # parses as .txt? no - forced below
+            session_factory=self._factory(session_maker),
+        )
+        # Force a genuine failure: an unsupported extension raises in parse().
+        await ingest_document(
+            uuid.UUID(document_id),
+            _TEST_USER_ID,
+            "note.exe",
+            b"garbage",
+            session_factory=self._factory(session_maker),
+        )
+
+        resp = await client.get(f"/api/v1/documents/{document_id}/status")
+        body = resp.json()
+        assert body["status"] == "failed"
+        assert body["error_message"], "a failure must carry a reason the user can read"
+
+    async def test_status_of_another_users_document_is_404(self, client, session_maker):
+        _, document_id = await self._workspace_with_pending_doc(client, session_maker)
+
+        other_user = uuid.uuid4()
+        app.dependency_overrides[get_current_user] = lambda: other_user
+        try:
+            resp = await client.get(f"/api/v1/documents/{document_id}/status")
+        finally:
+            app.dependency_overrides[get_current_user] = lambda: _TEST_USER_ID
+
+        # 404, not 403: a 403 would confirm the document exists.
+        assert resp.status_code == 404
+
+
+class TestDeletion:
+    async def _seed(self, client, session_maker, chunks=3):
+        ws = await client.post("/api/v1/workspaces", json={"name": f"Del {uuid.uuid4()}"})
+        workspace_id = uuid.UUID(ws.json()["id"])
+        document_id = uuid.uuid4()
+        async with session_maker() as session:
+            session.add(
+                Document(
+                    id=document_id,
+                    workspace_id=workspace_id,
+                    filename="doc.pdf",
+                    document_type="pdf",
+                    status="completed",
+                    chunk_count=chunks,
+                )
+            )
+            await session.flush()
+            session.add_all(
+                [
+                    DocumentChunk(
+                        id=uuid.uuid4(),
+                        document_id=document_id,
+                        content=f"chunk {i}",
+                        chunk_index=i,
+                        embedding=None,
+                        chunk_metadata={},
+                    )
+                    for i in range(chunks)
+                ]
+            )
+            await session.commit()
+        return workspace_id, document_id
+
+    async def test_delete_document_cascades_to_chunks(self, client, session_maker):
+        _, document_id = await self._seed(client, session_maker, chunks=3)
+
+        resp = await client.delete(f"/api/v1/documents/{document_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted_chunks"] == 3
+
+        async with session_maker() as session:
+            remaining = await session.execute(
+                select(DocumentChunk).where(DocumentChunk.document_id == document_id)
+            )
+            assert remaining.scalars().all() == [], "chunks must not outlive their document"
+
+    async def test_delete_workspace_cascades_to_documents_and_chunks(self, client, session_maker):
+        workspace_id, document_id = await self._seed(client, session_maker, chunks=2)
+
+        resp = await client.delete(f"/api/v1/workspaces/{workspace_id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["deleted_documents"] == 1
+        assert body["deleted_chunks"] == 2
+
+        async with session_maker() as session:
+            docs = await session.execute(
+                select(Document).where(Document.workspace_id == workspace_id)
+            )
+            chunks = await session.execute(
+                select(DocumentChunk).where(DocumentChunk.document_id == document_id)
+            )
+            assert docs.scalars().all() == []
+            assert chunks.scalars().all() == []
+
+    async def test_cannot_delete_another_users_workspace(self, client, session_maker):
+        workspace_id, _ = await self._seed(client, session_maker)
+
+        other_user = uuid.uuid4()
+        app.dependency_overrides[get_current_user] = lambda: other_user
+        try:
+            resp = await client.delete(f"/api/v1/workspaces/{workspace_id}")
+        finally:
+            app.dependency_overrides[get_current_user] = lambda: _TEST_USER_ID
+        assert resp.status_code == 404
+
+        async with session_maker() as session:
+            assert await session.get(Workspace, workspace_id) is not None, "must not be deleted"
+
+    async def test_cannot_delete_another_users_document(self, client, session_maker):
+        _, document_id = await self._seed(client, session_maker)
+
+        other_user = uuid.uuid4()
+        app.dependency_overrides[get_current_user] = lambda: other_user
+        try:
+            resp = await client.delete(f"/api/v1/documents/{document_id}")
+        finally:
+            app.dependency_overrides[get_current_user] = lambda: _TEST_USER_ID
+        assert resp.status_code == 404
+
+        async with session_maker() as session:
+            assert await session.get(Document, document_id) is not None

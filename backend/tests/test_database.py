@@ -3,6 +3,7 @@ import uuid
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import EMBEDDING_DIMENSIONS
@@ -15,6 +16,17 @@ async def async_session():
     """A fresh in-memory SQLite database (schema created from the same ORM
     models used against Postgres) for each test."""
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+
+    # SQLite ignores ON DELETE CASCADE unless foreign keys are enabled per
+    # connection. Without this the deletion endpoints - which rely on the FK
+    # cascade rather than loading every chunk into the session - would appear
+    # to work while leaving orphaned rows behind, and the cascade tests would
+    # pass vacuously. Postgres enforces FKs unconditionally.
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

@@ -1,7 +1,9 @@
 import { createClient } from "@/lib/supabase/client";
 import type {
   ClaimVerification,
-  DocumentUploadResponse,
+  DeletionResult,
+  DocumentStatusRead,
+  DocumentUploadAccepted,
   EntailmentLabel,
   Workspace,
   WorkspaceDocument,
@@ -120,11 +122,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return parsed as T;
 }
 
-/**
- * NOTE: the backend does not implement this route yet — `app/api/endpoints/
- * workspaces.py` currently registers only `POST ""`. This will reject with an
- * `ApiError(404)` until a list endpoint is added.
- */
+/** Lists the authenticated user's workspaces. */
 export function getWorkspaces(): Promise<Workspace[]> {
   return request<Workspace[]>("/workspaces", { method: "GET" });
 }
@@ -147,15 +145,38 @@ export function createWorkspace(name: string): Promise<Workspace> {
 export function uploadDocument(
   workspaceId: string,
   file: File
-): Promise<DocumentUploadResponse> {
+): Promise<DocumentUploadAccepted> {
   const formData = new FormData();
   formData.append("workspace_id", workspaceId);
   formData.append("files", file);
 
-  return request<DocumentUploadResponse>("/documents/upload", {
+  return request<DocumentUploadAccepted>("/documents/upload", {
     method: "POST",
     body: formData,
   });
+}
+
+/**
+ * Ingestion progress for one document. Poll until the status is terminal.
+ *
+ * Rejects with `ApiError(404)` for an unknown id *or* one belonging to
+ * another user — the backend returns the same status for both so ids cannot
+ * be enumerated.
+ */
+export function getDocumentStatus(documentId: string): Promise<DocumentStatusRead> {
+  return request<DocumentStatusRead>(`/documents/${documentId}/status`, {
+    method: "GET",
+  });
+}
+
+/** Deletes a document and, by cascade, every chunk beneath it. */
+export function deleteDocument(documentId: string): Promise<DeletionResult> {
+  return request<DeletionResult>(`/documents/${documentId}`, { method: "DELETE" });
+}
+
+/** Deletes a workspace and, by cascade, its documents, chunks, and chat history. */
+export function deleteWorkspace(workspaceId: string): Promise<DeletionResult> {
+  return request<DeletionResult>(`/workspaces/${workspaceId}`, { method: "DELETE" });
 }
 
 /** Rejects with `ApiError(404)` for an unknown `workspaceId`. */
