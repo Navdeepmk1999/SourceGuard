@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import struct
 
 import httpx
@@ -6,6 +7,8 @@ import numpy as np
 from fastapi import HTTPException
 
 from app.core.config import EMBEDDING_DIMENSIONS, Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingService:
@@ -48,11 +51,29 @@ class EmbeddingService:
         try:
             response = await client.post(
                 "/embeddings",
-                json={"model": self._settings.embedding_model, "input": texts},
+                json={
+                    "model": self._settings.embedding_model,
+                    "input": texts,
+                    # Requested explicitly rather than relying on the provider
+                    # default: gemini-embedding-001 natively emits 3072-dim
+                    # vectors and supports MRL truncation to 1536 or 768,
+                    # while the pgvector column is fixed at VECTOR(768) by DDL
+                    # and cannot absorb a different width.
+                    "dimensions": EMBEDDING_DIMENSIONS,
+                },
                 headers={"Authorization": f"Bearer {self._settings.together_api_key}"},
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
+            # Logged in full server-side because a 400 here most likely means
+            # the provider's OpenAI-compatibility layer rejected `dimensions`;
+            # the client only needs to know the upstream call failed.
+            logger.error(
+                "Embedding API request failed (model=%s, dimensions=%s): %r",
+                self._settings.embedding_model,
+                EMBEDDING_DIMENSIONS,
+                exc,
+            )
             raise HTTPException(status_code=502, detail=f"Embedding API request failed: {exc}") from exc
 
         payload = response.json()
@@ -60,6 +81,20 @@ class EmbeddingService:
 
         for embedding in embeddings:
             if len(embedding) != EMBEDDING_DIMENSIONS:
+                # The provider ignored the requested width. Name the remedy in
+                # the log: the pgvector column width is set at DDL time, so
+                # realigning means editing EMBEDDING_DIMENSIONS *and*
+                # recreating document_chunks - create_all will not alter it.
+                logger.error(
+                    "Embedding width mismatch: %s returned %d dimensions, expected %d. "
+                    "The provider ignored the requested `dimensions`. Either use an "
+                    "endpoint that honors it, or set EMBEDDING_DIMENSIONS=%d and "
+                    "recreate the document_chunks table.",
+                    self._settings.embedding_model,
+                    len(embedding),
+                    EMBEDDING_DIMENSIONS,
+                    len(embedding),
+                )
                 raise HTTPException(
                     status_code=502,
                     detail=(

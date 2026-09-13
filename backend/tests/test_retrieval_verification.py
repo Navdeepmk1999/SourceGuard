@@ -1,8 +1,13 @@
+import json
 import uuid
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
+
+from app.core.config import get_settings
 
 from app.services.embeddings import EMBEDDING_DIMENSIONS, EmbeddingService
 from app.services.nli_verifier import EntailmentLabel, NLIVerifierService
@@ -252,3 +257,71 @@ class TestNLIEntailmentScoring:
     def test_invalid_thresholds_raise_value_error(self):
         with pytest.raises(ValueError):
             NLIVerifierService(entailment_threshold=0.2, insufficient_threshold=0.6)
+
+
+class TestEmbeddingServiceLiveRequest:
+    """Covers the live HTTP path, which previously had no test at all.
+
+    The pgvector column is fixed at VECTOR(EMBEDDING_DIMENSIONS) by DDL and
+    `create_all` will not alter it, so the request must pin the width rather
+    than accept whatever the provider defaults to. gemini-embedding-001
+    natively emits 3072 dimensions and truncates via Matryoshka only when
+    asked, which makes the `dimensions` field load-bearing, not cosmetic.
+    """
+
+    @staticmethod
+    def _service(handler) -> EmbeddingService:
+        settings = get_settings().model_copy(
+            update={"together_api_key": "test-key", "embedding_model": "gemini-embedding-001"}
+        )
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="https://example.invalid/v1"
+        )
+        return EmbeddingService(settings=settings, client=client)
+
+    async def test_request_pins_the_vector_width(self):
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200, json={"data": [{"embedding": [0.1] * EMBEDDING_DIMENSIONS}]}
+            )
+
+        service = self._service(handler)
+        embedding = await service.embed("hello")
+
+        assert captured["dimensions"] == EMBEDDING_DIMENSIONS
+        assert captured["model"] == "gemini-embedding-001"
+        assert len(embedding) == EMBEDDING_DIMENSIONS
+
+    async def test_wrong_width_is_rejected_not_persisted(self):
+        """A provider that ignores `dimensions` must fail loudly.
+
+        Returning the native 3072 here is the realistic failure: without this
+        check the vector reaches the INSERT and either errors opaquely or, on
+        a permissive backend, silently corrupts search.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": [{"embedding": [0.1] * 3072}]})
+
+        service = self._service(handler)
+        with pytest.raises(HTTPException) as exc:
+            await service.embed("hello")
+
+        assert exc.value.status_code == 502
+        assert "3072" in exc.value.detail
+        assert str(EMBEDDING_DIMENSIONS) in exc.value.detail
+
+    async def test_rejected_dimensions_parameter_surfaces_as_502(self):
+        """If the compatibility layer rejects `dimensions`, it must not 500."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"error": {"message": "Unknown field: dimensions"}})
+
+        service = self._service(handler)
+        with pytest.raises(HTTPException) as exc:
+            await service.embed("hello")
+
+        assert exc.value.status_code == 502
