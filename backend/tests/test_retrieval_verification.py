@@ -263,10 +263,9 @@ class TestEmbeddingServiceLiveRequest:
     """Covers the live HTTP path, which previously had no test at all.
 
     The pgvector column is fixed at VECTOR(EMBEDDING_DIMENSIONS) by DDL and
-    `create_all` will not alter it, so the request must pin the width rather
-    than accept whatever the provider defaults to. gemini-embedding-001
-    natively emits 3072 dimensions and truncates via Matryoshka only when
-    asked, which makes the `dimensions` field load-bearing, not cosmetic.
+    `create_all` will not alter it, so any drift between the configured width
+    and what the provider actually returns must surface as a loud 502 rather
+    than an opaque INSERT failure.
     """
 
     @staticmethod
@@ -279,7 +278,15 @@ class TestEmbeddingServiceLiveRequest:
         )
         return EmbeddingService(settings=settings, client=client)
 
-    async def test_request_pins_the_vector_width(self):
+    async def test_request_omits_the_dimensions_field(self):
+        """Gemini 400s if `dimensions` is present - regression guard.
+
+        Sending it is the intuitive way to pin the vector width, and it is
+        what the OpenAI embeddings spec allows, so it is an easy thing to
+        re-add. Gemini's compatibility layer rejects the whole request, which
+        takes down ingestion and query together. The width is instead matched
+        by setting EMBEDDING_DIMENSIONS to the model's native output.
+        """
         captured: dict = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -291,27 +298,29 @@ class TestEmbeddingServiceLiveRequest:
         service = self._service(handler)
         embedding = await service.embed("hello")
 
-        assert captured["dimensions"] == EMBEDDING_DIMENSIONS
+        assert "dimensions" not in captured, "Gemini returns 400 when `dimensions` is sent"
         assert captured["model"] == "gemini-embedding-001"
         assert len(embedding) == EMBEDDING_DIMENSIONS
 
     async def test_wrong_width_is_rejected_not_persisted(self):
-        """A provider that ignores `dimensions` must fail loudly.
+        """A width other than the configured one must fail loudly.
 
-        Returning the native 3072 here is the realistic failure: without this
-        check the vector reaches the INSERT and either errors opaquely or, on
-        a permissive backend, silently corrupts search.
+        Realistic trigger: swapping embedding_model to a model with a
+        different native width without updating EMBEDDING_DIMENSIONS. Without
+        this check the vector reaches the INSERT and either errors opaquely
+        or, on a permissive backend, silently corrupts search.
         """
+        wrong_width = EMBEDDING_DIMENSIONS // 4
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"data": [{"embedding": [0.1] * 3072}]})
+            return httpx.Response(200, json={"data": [{"embedding": [0.1] * wrong_width}]})
 
         service = self._service(handler)
         with pytest.raises(HTTPException) as exc:
             await service.embed("hello")
 
         assert exc.value.status_code == 502
-        assert "3072" in exc.value.detail
+        assert str(wrong_width) in exc.value.detail
         assert str(EMBEDDING_DIMENSIONS) in exc.value.detail
 
     async def test_rejected_dimensions_parameter_surfaces_as_502(self):

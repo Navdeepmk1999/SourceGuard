@@ -51,16 +51,11 @@ class EmbeddingService:
         try:
             response = await client.post(
                 "/embeddings",
-                json={
-                    "model": self._settings.embedding_model,
-                    "input": texts,
-                    # Requested explicitly rather than relying on the provider
-                    # default: gemini-embedding-001 natively emits 3072-dim
-                    # vectors and supports MRL truncation to 1536 or 768,
-                    # while the pgvector column is fixed at VECTOR(768) by DDL
-                    # and cannot absorb a different width.
-                    "dimensions": EMBEDDING_DIMENSIONS,
-                },
+                # NOTE: do not add a "dimensions" field here. Gemini's
+                # OpenAI-compatibility layer returns 400 Bad Request when it is
+                # present, so the vector width is whatever the model natively
+                # emits and EMBEDDING_DIMENSIONS must be set to match it.
+                json={"model": self._settings.embedding_model, "input": texts},
                 headers={"Authorization": f"Bearer {self._settings.together_api_key}"},
             )
             response.raise_for_status()

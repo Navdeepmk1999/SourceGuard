@@ -15,16 +15,18 @@ ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 # `create_all` will not alter an existing VECTOR(n) column, so the table must
 # be dropped and recreated and every document re-ingested.
 #
-# 768 is a Matryoshka (MRL) truncation of gemini-embedding-001, whose native
-# width is 3072. EmbeddingService requests it explicitly via the `dimensions`
-# field; if the provider ignores or rejects that, the width check in
-# embed_batch raises a 502 naming the actual width rather than persisting a
-# wrong-width vector that would fail at INSERT or poison search.
+# 3072 is the NATIVE output width of gemini-embedding-001.
 #
-# Truncated MRL vectors are not unit-normalized, which is fine here: retrieval
-# ranks by pgvector COSINE distance (retriever.py), which is scale-invariant.
-# It would matter if the operator were ever changed to L2.
-EMBEDDING_DIMENSIONS = 768
+# Matryoshka truncation to 768 or 1536 is reachable only by sending a
+# `dimensions` field on the request, and Gemini's OpenAI-compatibility layer
+# rejects that field with 400 Bad Request. The native width is therefore what
+# the API returns, and this constant must match it. See the NOTE in
+# embeddings.py::embed_batch before attempting to shrink this again.
+#
+# The width check in embed_batch still guards this: a mismatch raises a 502
+# naming the actual width rather than persisting a wrong-width vector that
+# would fail at INSERT or silently poison search.
+EMBEDDING_DIMENSIONS = 3072
 
 logger = logging.getLogger(__name__)
 
