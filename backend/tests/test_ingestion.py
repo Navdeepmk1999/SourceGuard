@@ -303,6 +303,21 @@ class TestSettingsEnvParsing:
         monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
         assert Settings(_env_file=None).cors_allowed_origins == ["http://localhost:3000"]
 
+    def test_blank_value_falls_back_to_default_not_deny_all(self, monkeypatch):
+        """A blank value must not split into `[]`.
+
+        An empty allow-list is enforced by CORSMiddleware as *deny every
+        origin*, which fails silently and totally: the service stays healthy,
+        /health responds, and every browser request dies at preflight. This
+        happened in production - declaring the key in a deploy manifest
+        without filling in a value was enough to trigger it.
+        """
+        for blank in ("", "   ", " , , "):
+            monkeypatch.setenv("CORS_ALLOWED_ORIGINS", blank)
+            origins = Settings(_env_file=None).cors_allowed_origins
+            assert origins == ["http://localhost:3000"], f"blank {blank!r} produced {origins!r}"
+            assert origins, "an empty allow-list blocks every origin"
+
     def test_app_imports_with_origins_set(self, monkeypatch):
         """The actual failure mode: the app would not start at all."""
         monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://app.vercel.app")

@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
@@ -10,8 +11,18 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 # Fixed by the pgvector column schema (app/models/chunk.py). Not environment
-# configurable: changing this requires a DB migration, not a .env edit.
-EMBEDDING_DIMENSIONS = 1536
+# configurable: changing this requires a DB migration, not a .env edit -
+# `create_all` will not alter an existing VECTOR(n) column, so the table must
+# be dropped and recreated and every document re-ingested.
+#
+# 768 matches Google's text-embedding-004. Changing provider without changing
+# this raises a 502 from EmbeddingService rather than persisting a
+# wrong-width vector (see embeddings.py::embed_batch).
+EMBEDDING_DIMENSIONS = 768
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_CORS_ORIGINS = ["http://localhost:3000"]
 
 
 class Settings(BaseSettings):
@@ -57,7 +68,7 @@ class Settings(BaseSettings):
     groq_model: str = "openai/gpt-oss-20b"
     together_api_key: str = ""
     together_api_base: str = "https://api.together.xyz/v1"
-    embedding_model: str = "togethercomputer/m2-bert-80M-32k-retrieval"
+    embedding_model: str = "text-embedding-004"
 
     # Chunking defaults
     chunk_size: int = 1000
@@ -73,7 +84,7 @@ class Settings(BaseSettings):
     # SettingsError at import and the process never starts; only a JSON array
     # would parse. NoDecode suppresses that decode so the validator below
     # actually receives the string and can split it.
-    cors_allowed_origins: Annotated[list[str], NoDecode] = ["http://localhost:3000"]
+    cors_allowed_origins: Annotated[list[str], NoDecode] = _DEFAULT_CORS_ORIGINS
 
     # Auth: verifies Supabase-issued JWTs via JWKS (see app/api/deps.py::
     # get_current_user). This project's Supabase signing key is ES256/
@@ -107,8 +118,33 @@ class Settings(BaseSettings):
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
     def _split_comma_separated_origins(cls, value: object) -> object:
+        """Splits a comma-separated origin list, treating blank as unset.
+
+        A blank or whitespace-only value used to split into `[]` - an empty
+        allow-list, which CORSMiddleware enforces as *deny every origin*,
+        including the default. The failure is silent and total: the service
+        stays healthy, `/health` responds, and every browser request is
+        rejected at preflight with an opaque "unable to reach the API" on the
+        client. Declaring the variable in a deploy manifest without filling
+        in a value is enough to trigger it.
+
+        A blank value therefore falls back to the default rather than
+        producing a stricter-than-default deny-all, and warns so the
+        misconfiguration is visible in logs instead of only in a browser
+        console.
+        """
         if isinstance(value, str):
-            return [origin.strip() for origin in value.split(",") if origin.strip()]
+            origins = [origin.strip() for origin in value.split(",") if origin.strip()]
+            if not origins:
+                logger.warning(
+                    "CORS_ALLOWED_ORIGINS is set but empty; falling back to the default "
+                    "%s. An empty list would block every origin, including local "
+                    "development. Set it to your frontend origin, e.g. "
+                    "https://your-app.vercel.app",
+                    _DEFAULT_CORS_ORIGINS,
+                )
+                return list(_DEFAULT_CORS_ORIGINS)
+            return origins
         return value
 
 

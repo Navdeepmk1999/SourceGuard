@@ -89,6 +89,15 @@ services:
       # The backend's allow-list is exact with no wildcards, so this must
       # match the deployed frontend origin character for character. Set it
       # after the first Vercel deploy; add preview URLs comma-separated.
+      #
+      # ⚠️ MUST NOT BE LEFT BLANK. `sync: false` creates the key in the
+      # dashboard awaiting a value, and a blank value previously split into
+      # an empty allow-list — which CORSMiddleware enforces as *deny every
+      # origin*. The service stays healthy and /health responds while every
+      # browser request dies at preflight, surfacing on the client as an
+      # opaque "Unable to reach the SourceGuard API". app/core/config.py now
+      # falls back to the default and logs a warning instead, but the
+      # frontend still cannot reach the API until this holds the real origin.
       - key: CORS_ALLOWED_ORIGINS
         sync: false
 

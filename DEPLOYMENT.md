@@ -311,6 +311,23 @@ CORS_ALLOWED_ORIGINS=https://sourceguard.vercel.app
 Add preview deployments as a comma-separated list if you want them to reach
 the API. Render restarts the service on an environment change.
 
+> **Do not leave this blank.** A blank value produced an empty allow-list,
+> which CORSMiddleware enforces as *deny every origin* — the service stays
+> healthy and `/health` responds while every browser request fails at
+> preflight, showing only "Unable to reach the SourceGuard API" on the
+> client. `config.py` now falls back to the default and logs a warning, but
+> the frontend still cannot reach the API until this holds the real origin.
+
+Confirm the deployed allow-list from the shell — a successful preflight
+returns `access-control-allow-origin`; a rejected one returns **400
+"Disallowed CORS origin"** with that header absent:
+
+```bash
+curl -i -X OPTIONS https://<service>.onrender.com/api/v1/workspaces \
+  -H "Origin: https://<your-app>.vercel.app" \
+  -H "Access-Control-Request-Method: GET" | grep -i "access-control-allow-origin"
+```
+
 ---
 
 ## Step 6 — Verify the deployment

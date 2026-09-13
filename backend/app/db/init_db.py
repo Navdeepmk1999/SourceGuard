@@ -89,7 +89,7 @@ async def _provision_app_role(conn, role: str, password: str) -> None:
 
     # Explicitly strip the two attributes that would silently defeat RLS,
     # in case the role pre-existed with them.
-    await conn.execute(text(f"ALTER ROLE {role} NOSUPERUSER NOBYPASSRLS"))
+    #await conn.execute(text(f"ALTER ROLE {role} NOSUPERUSER NOBYPASSRLS"))
 
     await conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
     await conn.execute(

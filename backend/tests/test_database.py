@@ -5,6 +5,7 @@ import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.core.config import EMBEDDING_DIMENSIONS
 from app.models import AuditLog, Document, DocumentChunk, Workspace
 from app.models.base import Base
 
@@ -56,7 +57,7 @@ class TestWorkspaceDocumentChunkRelationships:
             document_id=document.id,
             content="hello world",
             chunk_index=0,
-            embedding=[0.1] * 1536,
+            embedding=[0.1] * EMBEDDING_DIMENSIONS,
             chunk_metadata={"source": "report.pdf"},
         )
         async_session.add(chunk)
@@ -70,7 +71,7 @@ class TestWorkspaceDocumentChunkRelationships:
         assert len(document.chunks) == 1
         assert document.chunks[0].content == "hello world"
         assert document.chunks[0].chunk_metadata == {"source": "report.pdf"}
-        assert len(document.chunks[0].embedding) == 1536
+        assert len(document.chunks[0].embedding) == EMBEDDING_DIMENSIONS
         assert document.workspace.id == workspace.id
 
     async def test_cascade_delete_workspace_removes_documents_and_chunks(self, async_session):
