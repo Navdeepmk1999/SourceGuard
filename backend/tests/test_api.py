@@ -2,6 +2,7 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -804,3 +805,138 @@ class TestDeletion:
 
         async with session_maker() as session:
             assert await session.get(Document, document_id) is not None
+
+
+class TestCorsPreflight:
+    """Preflight must pass for every verb the API actually serves.
+
+    An explicit allow_methods list silently broke DELETE the moment the
+    deletion routes were added: the browser's OPTIONS preflight got a 400 with
+    no access-control-allow-origin, so the request never left the client and
+    the backend logged nothing.
+    """
+
+    @staticmethod
+    def _preflight(client, method: str, origin: str = "http://localhost:3000"):
+        return client.options(
+            "/api/v1/workspaces/00000000-0000-0000-0000-000000000000",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": method,
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+
+    @pytest.mark.parametrize("method", ["GET", "POST", "DELETE", "PATCH", "PUT"])
+    async def test_preflight_allows_every_verb(self, client, method):
+        response = await self._preflight(client, method)
+
+        assert response.status_code == 200
+        # Without this header the browser blocks the request regardless of
+        # what the backend would have done.
+        assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+    async def test_preflight_still_rejects_an_unknown_origin(self, client):
+        # Wildcarding methods must not have loosened the origin allow-list.
+        response = await self._preflight(client, "DELETE", origin="https://evil.example.com")
+
+        assert response.headers.get("access-control-allow-origin") is None
+
+
+class TestIngestionFailureReporting:
+    """Ingestion must never report success for a document it cannot search."""
+
+    @staticmethod
+    def _factory(session_maker):
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def factory(_user_id):
+            async with session_maker() as session:
+                yield session
+
+        return factory
+
+    async def _pending_document(self, client):
+        ws = await client.post("/api/v1/workspaces", json={"name": f"WS {uuid.uuid4()}"})
+        resp = await client.post(
+            "/api/v1/documents/upload",
+            data={"workspace_id": ws.json()["id"]},
+            files=[("files", ("scan.txt", b"placeholder", "text/plain"))],
+        )
+        return resp.json()["documents"][0]["document_id"]
+
+    async def test_zero_chunks_is_a_failure_not_a_silent_success(self, client, session_maker):
+        """The production symptom: 'uploads result in 0 chunks'.
+
+        A file with no extractable text used to commit as 'completed' with
+        chunk_count 0 - the upload looked fine, the document appeared in the
+        sidebar, and it was absent from every answer with nothing to explain
+        why. The usual real-world cause is a scanned PDF, which this pipeline
+        cannot read because there is no OCR step.
+        """
+        from app.services.ingestion import ingest_document
+
+        document_id = await self._pending_document(client)
+
+        await ingest_document(
+            uuid.UUID(document_id),
+            _TEST_USER_ID,
+            "scan.txt",
+            b"   \n  \n ",
+            session_factory=self._factory(session_maker),
+        )
+
+        body = (await client.get(f"/api/v1/documents/{document_id}/status")).json()
+        assert body["status"] == "failed"
+        assert body["chunk_count"] == 0
+        assert "No extractable text" in body["error_message"]
+
+    async def test_failure_is_recorded_even_when_the_session_is_poisoned(
+        self, client, session_maker
+    ):
+        """A crash mid-insert leaves the transaction aborted.
+
+        Recording the failure therefore needs its own session - reusing the
+        broken one raises on every statement and the user would never learn
+        the upload failed.
+        """
+        from unittest.mock import patch
+
+        from app.services import ingestion
+
+        document_id = await self._pending_document(client)
+
+        with patch.object(
+            ingestion.EmbeddingService, "embed_batch", side_effect=RuntimeError("provider exploded")
+        ):
+            await ingestion.ingest_document(
+                uuid.UUID(document_id),
+                _TEST_USER_ID,
+                "note.txt",
+                b"Hello world. This is a real document body. " * 20,
+                session_factory=self._factory(session_maker),
+            )
+
+        body = (await client.get(f"/api/v1/documents/{document_id}/status")).json()
+        assert body["status"] == "failed"
+        assert "provider exploded" in body["error_message"]
+
+    async def test_status_write_that_matches_no_row_is_an_error(self, client, session_maker):
+        """An UPDATE matching zero rows commits happily in SQL.
+
+        So a document deleted mid-ingestion - or one filtered out because the
+        RLS tenant context went missing - would otherwise be reported as
+        ingested while nothing was written.
+        """
+        from app.services.ingestion import IngestionError, _finalize
+        from app.schemas.document import DocumentStatus
+
+        async with session_maker() as session:
+            with pytest.raises(IngestionError, match="was not updated"):
+                await _finalize(
+                    session,
+                    uuid.uuid4(),  # never existed
+                    status=DocumentStatus.COMPLETED,
+                    chunk_count=5,
+                )

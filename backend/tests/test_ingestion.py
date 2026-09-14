@@ -299,6 +299,25 @@ class TestSettingsEnvParsing:
         monkeypatch.setenv("CORS_ALLOWED_ORIGINS", " https://a.com , https://b.com ")
         assert Settings(_env_file=None).cors_allowed_origins == ["https://a.com", "https://b.com"]
 
+    def test_json_array_form_is_parsed(self, monkeypatch):
+        """Both encodings appear in real deploys, so both must work.
+
+        The local .env used JSON-array syntax while Render used a bare string.
+        NoDecode suppresses pydantic-settings' own json.loads, so without an
+        explicit branch the array was comma-split into fragments like
+        '["https://a.app"' - an allow-list that matches no origin and fails
+        every preflight.
+        """
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", '["https://a.app","https://b.app"]')
+        assert Settings(_env_file=None).cors_allowed_origins == [
+            "https://a.app",
+            "https://b.app",
+        ]
+
+    def test_empty_json_array_is_not_deny_all(self, monkeypatch):
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "[]")
+        assert Settings(_env_file=None).cors_allowed_origins == ["http://localhost:3000"]
+
     def test_default_applies_when_unset(self, monkeypatch):
         monkeypatch.delenv("CORS_ALLOWED_ORIGINS", raising=False)
         assert Settings(_env_file=None).cors_allowed_origins == ["http://localhost:3000"]

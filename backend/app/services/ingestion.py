@@ -77,16 +77,23 @@ async def ingest_document(
                         )
                     )
 
-            await session.execute(
-                update(Document)
-                .where(Document.id == document_id)
-                .values(
-                    status=DocumentStatus.COMPLETED.value,
-                    chunk_count=len(chunks),
-                    error_message=None,
+            if not chunks:
+                # Previously this committed as 'completed' with chunk_count 0:
+                # the upload looked successful, the document appeared in the
+                # sidebar, and it was silently absent from every answer. The
+                # usual cause is a PDF with no text layer (a scan), which this
+                # pipeline cannot read - there is no OCR step.
+                raise IngestionError(
+                    f"No extractable text found in '{filename}'. If this is a scanned "
+                    "PDF, it needs OCR, which is not supported."
                 )
+
+            await _finalize(
+                session,
+                document_id,
+                status=DocumentStatus.COMPLETED,
+                chunk_count=len(chunks),
             )
-            await session.commit()
             logger.info("Ingested document %s (%d chunks)", document_id, len(chunks))
 
     except Exception as exc:
@@ -94,11 +101,43 @@ async def ingest_document(
         await _record_failure(document_id, user_id, exc, factory)
 
 
-async def _set_status(session, document_id: uuid.UUID, status: DocumentStatus) -> None:
-    await session.execute(
-        update(Document).where(Document.id == document_id).values(status=status.value)
+class IngestionError(RuntimeError):
+    """An ingestion failure whose message is safe to show the user."""
+
+
+async def _finalize(
+    session: AsyncSession,
+    document_id: uuid.UUID,
+    *,
+    status: DocumentStatus,
+    chunk_count: int | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Writes a status transition and verifies it actually landed.
+
+    The rowcount check is the important part. An UPDATE that matches no rows
+    is not an error in SQL - it commits happily - so if the document were
+    deleted mid-ingestion, or the RLS tenant context were missing and the
+    policy filtered the row out, this would report success while writing
+    nothing. That is the exact shape of a silent failure.
+    """
+    values: dict = {"status": status.value, "error_message": error_message}
+    if chunk_count is not None:
+        values["chunk_count"] = chunk_count
+
+    result = await session.execute(
+        update(Document).where(Document.id == document_id).values(**values)
     )
+    if result.rowcount == 0:
+        raise IngestionError(
+            f"Document {document_id} was not updated - it may have been deleted, "
+            "or the tenant context is missing and RLS filtered it out."
+        )
     await session.commit()
+
+
+async def _set_status(session, document_id: uuid.UUID, status: DocumentStatus) -> None:
+    await _finalize(session, document_id, status=status)
 
 
 async def _record_failure(
@@ -114,22 +153,38 @@ async def _record_failure(
     user ever learns the upload did not work.
     """
     try:
+        # A FRESH session, deliberately. Whatever failed above may have left
+        # the original one in an aborted transaction, where every further
+        # statement raises InFailedSqlTransaction - so reusing it would lose
+        # the only record the user will ever see.
         async with session_factory(user_id) as session:
-            await session.execute(
-                update(Document)
-                .where(Document.id == document_id)
-                .values(
-                    status=DocumentStatus.FAILED.value,
-                    # str(exc) rather than repr: this reaches the UI, and
-                    # HTTPException's repr is noise to an end user.
-                    error_message=str(exc)[:1000] or exc.__class__.__name__,
-                )
+            await _finalize(
+                session,
+                document_id,
+                status=DocumentStatus.FAILED,
+                error_message=_user_facing_message(exc),
             )
-            await session.commit()
     except Exception:
-        # Nothing further can be done - the document stays 'processing' and
-        # will be picked up by the stale reaper.
-        logger.exception("Could not record ingestion failure for %s", document_id)
+        # The failure could not even be recorded. Escalated to CRITICAL
+        # because the document is now stranded at 'processing' with no
+        # explanation anywhere except this line.
+        logger.critical(
+            "Could not record ingestion failure for %s - document is stranded",
+            document_id,
+            exc_info=True,
+        )
+
+
+def _user_facing_message(exc: Exception) -> str:
+    """A short reason suitable for display next to the document.
+
+    `.detail` is preferred over `str(exc)` for HTTPException, whose str() is
+    formatted as "400: ..." and reads like a bug report rather than an
+    explanation.
+    """
+    detail = getattr(exc, "detail", None)
+    message = str(detail) if detail else str(exc)
+    return (message or exc.__class__.__name__)[:1000]
 
 
 async def reap_stale_documents(

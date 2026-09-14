@@ -12,7 +12,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    # Wildcard rather than an explicit list: the list was a standing source of
+    # 400s on preflight, because every new route with a new verb (DELETE, and
+    # PATCH/PUT when they arrive) silently fails CORS until someone remembers
+    # to add it here. Methods are not the access control boundary - the origin
+    # allow-list above is, and it stays explicit with no wildcard.
+    allow_methods=["*"],
     allow_headers=["Content-Type", "Authorization"],
 )
 

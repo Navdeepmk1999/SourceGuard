@@ -1,3 +1,4 @@
+import json
 import logging
 from functools import lru_cache
 from pathlib import Path
@@ -36,6 +37,22 @@ EMBEDDING_DIMENSIONS = 3072
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CORS_ORIGINS = ["http://localhost:3000"]
+
+
+def _empty_cors_fallback() -> list[str]:
+    """Blank means unset, never deny-all.
+
+    An empty allow-list is enforced by CORSMiddleware as *deny every origin*,
+    which fails silently and totally: the service stays healthy, /health
+    responds, and every browser request dies at preflight.
+    """
+    logger.warning(
+        "CORS_ALLOWED_ORIGINS is set but empty; falling back to the default %s. "
+        "An empty list would block every origin, including local development. "
+        "Set it to your frontend origin, e.g. https://your-app.vercel.app",
+        _DEFAULT_CORS_ORIGINS,
+    )
+    return list(_DEFAULT_CORS_ORIGINS)
 
 
 class Settings(BaseSettings):
@@ -147,16 +164,28 @@ class Settings(BaseSettings):
         console.
         """
         if isinstance(value, str):
-            origins = [origin.strip() for origin in value.split(",") if origin.strip()]
+            candidate = value.strip()
+
+            # JSON array form, e.g. '["https://a.app", "https://b.app"]'.
+            # NoDecode above suppressed pydantic-settings' own json.loads, so
+            # without this branch a JSON value would be comma-split into
+            # fragments like '["https://a.app"' - a mangled allow-list that
+            # matches no origin and fails every preflight.
+            if candidate.startswith("[") and candidate.endswith("]"):
+                try:
+                    parsed = json.loads(candidate)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    origins = [str(origin).strip() for origin in parsed if str(origin).strip()]
+                    # An empty array is handled by the blank branch below
+                    # rather than returned, so "[]" cannot produce a deny-all.
+                    return origins or _empty_cors_fallback()
+            else:
+                origins = [origin.strip() for origin in candidate.split(",") if origin.strip()]
+
             if not origins:
-                logger.warning(
-                    "CORS_ALLOWED_ORIGINS is set but empty; falling back to the default "
-                    "%s. An empty list would block every origin, including local "
-                    "development. Set it to your frontend origin, e.g. "
-                    "https://your-app.vercel.app",
-                    _DEFAULT_CORS_ORIGINS,
-                )
-                return list(_DEFAULT_CORS_ORIGINS)
+                return _empty_cors_fallback()
             return origins
         return value
 
