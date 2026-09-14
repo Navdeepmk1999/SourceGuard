@@ -4,11 +4,13 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
 } from "react";
 import { ApiError, createWorkspace, deleteWorkspace, getWorkspaces } from "@/lib/api";
+import { createClient } from "@/lib/supabase/client";
 import type { DeletionResult, Workspace } from "@/types";
 
 interface WorkspaceContextValue {
@@ -25,6 +27,8 @@ interface WorkspaceContextValue {
    */
   removeWorkspace: (workspaceId: string) => Promise<DeletionResult | null>;
   setActiveWorkspace: (workspace: Workspace | null) => void;
+  /** Drops every trace of the current user's data from memory. */
+  clearWorkspaces: () => void;
 }
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
@@ -100,6 +104,52 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const clearWorkspaces = useCallback(() => {
+    setWorkspaces([]);
+    setActiveWorkspace(null);
+    setError(null);
+    setIsLoading(false);
+  }, []);
+
+  useEffect(() => {
+    const supabase = createClient();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      // Deliberately NOT an async callback. Supabase's client serialises auth
+      // calls behind a lock, and awaiting another auth call (which
+      // fetchWorkspaces does, via getAuthHeaders -> getSession) from inside
+      // this callback deadlocks. Deferring to a macrotask lets the lock
+      // release first.
+      if (event === "SIGNED_OUT") {
+        // Wiped synchronously: this must not be schedulable behind anything
+        // that could render the previous user's data first.
+        clearWorkspaces();
+        return;
+      }
+
+      if (event === "SIGNED_IN" || event === "INITIAL_SESSION") {
+        if (!session) {
+          clearWorkspaces();
+          return;
+        }
+        setTimeout(() => void fetchWorkspaces(), 0);
+        return;
+      }
+
+      if (event === "USER_UPDATED" && !session) {
+        // The account was deleted or disabled out from under this tab.
+        clearWorkspaces();
+      }
+
+      // TOKEN_REFRESHED and PASSWORD_RECOVERY deliberately fall through:
+      // the identity has not changed, so refetching would be wasted work.
+    });
+
+    return () => subscription.unsubscribe();
+  }, [clearWorkspaces, fetchWorkspaces]);
+
   const value = useMemo<WorkspaceContextValue>(
     () => ({
       workspaces,
@@ -110,6 +160,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       addWorkspace,
       removeWorkspace,
       setActiveWorkspace,
+      clearWorkspaces,
     }),
     [
       workspaces,
@@ -119,6 +170,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       fetchWorkspaces,
       addWorkspace,
       removeWorkspace,
+      clearWorkspaces,
     ]
   );
 

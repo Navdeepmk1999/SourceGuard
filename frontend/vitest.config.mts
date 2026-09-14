@@ -23,5 +23,14 @@ export default defineConfig({
     include: ["src/**/*.test.{ts,tsx}"],
     css: false,
     restoreMocks: true,
+    // NEXT_PUBLIC_* are inlined at build time and read at module load, so
+    // api.ts captures NEXT_PUBLIC_API_URL the moment it is imported. Without
+    // a value here every request short-circuits on "not configured" before
+    // any fetch is attempted.
+    env: {
+      NEXT_PUBLIC_API_URL: "http://api.test/api/v1",
+      NEXT_PUBLIC_SUPABASE_URL: "https://test-project.supabase.co",
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "test-publishable-key",
+    },
   },
 });

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { ShieldCheck } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
@@ -17,6 +17,54 @@ export default function LoginPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmationSent, setConfirmationSent] = useState(false);
+  // Set when Supabase rejects a sign-in because the address was never
+  // confirmed. Without an explicit resend, a user whose first email was lost
+  // or expired has no way forward from this screen at all.
+  const [needsConfirmation, setNeedsConfirmation] = useState(false);
+  const [isResending, setIsResending] = useState(false);
+  const [resendNotice, setResendNotice] = useState<string | null>(null);
+  // Supabase rate-limits resends (a 429 with an unhelpful message), so the
+  // button is held closed for a cooldown rather than letting the user hit the
+  // limit and see a confusing error.
+  const [resendCooldown, setResendCooldown] = useState(0);
+
+  useEffect(() => {
+    if (resendCooldown <= 0) {
+      return;
+    }
+    const timer = setTimeout(() => setResendCooldown((seconds) => seconds - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [resendCooldown]);
+
+  async function handleResendConfirmation() {
+    if (isResending || resendCooldown > 0 || !email) {
+      return;
+    }
+    setIsResending(true);
+    setError(null);
+    setResendNotice(null);
+
+    try {
+      const supabase = createClient();
+      const { error: resendError } = await supabase.auth.resend({
+        type: "signup",
+        email,
+        options: { emailRedirectTo: `${window.location.origin}/login` },
+      });
+
+      if (resendError) {
+        setError(resendError.message);
+        return;
+      }
+      // Worded so it reveals nothing about whether the address is registered.
+      setResendNotice("If that address needs confirming, a new link is on its way.");
+      setResendCooldown(60);
+    } catch {
+      setError("Unable to reach Supabase. Check your connection and try again.");
+    } finally {
+      setIsResending(false);
+    }
+  }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -26,6 +74,8 @@ export default function LoginPage() {
 
     setError(null);
     setConfirmationSent(false);
+    setNeedsConfirmation(false);
+    setResendNotice(null);
     setIsSubmitting(true);
 
     try {
@@ -38,6 +88,12 @@ export default function LoginPage() {
         });
         if (signInError) {
           setError(signInError.message);
+          // Supabase reports this as an error code rather than a distinct
+          // status, and older projects only set the message.
+          const unconfirmed =
+            signInError.code === "email_not_confirmed" ||
+            /confirm/i.test(signInError.message);
+          setNeedsConfirmation(unconfirmed);
           return;
         }
         router.push("/");
@@ -57,6 +113,7 @@ export default function LoginPage() {
           router.refresh();
         } else {
           setConfirmationSent(true);
+          setNeedsConfirmation(true);
         }
       }
     } catch {
@@ -154,6 +211,30 @@ export default function LoginPage() {
             <p className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300">
               Check your email to confirm your account before signing in.
             </p>
+          )}
+
+          {resendNotice && (
+            <p
+              role="status"
+              className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300"
+            >
+              {resendNotice}
+            </p>
+          )}
+
+          {needsConfirmation && (
+            <button
+              type="button"
+              onClick={() => void handleResendConfirmation()}
+              disabled={isResending || resendCooldown > 0 || !email}
+              className="text-sm text-indigo-400 transition-colors hover:text-indigo-300 disabled:cursor-not-allowed disabled:text-zinc-600"
+            >
+              {isResending
+                ? "Sending…"
+                : resendCooldown > 0
+                  ? `Resend confirmation email (${resendCooldown}s)`
+                  : "Resend confirmation email"}
+            </button>
           )}
 
           <button

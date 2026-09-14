@@ -22,7 +22,18 @@ vi.mock("next/navigation", () => ({
 }));
 
 vi.mock("@/lib/supabase/client", () => ({
-  createClient: () => ({ auth: { signOut: vi.fn().mockResolvedValue({ error: null }) } }),
+  createClient: () => ({
+    auth: {
+      signOut: vi.fn().mockResolvedValue({ error: null }),
+      // Sidebar no longer fetches on mount - WorkspaceProvider loads
+      // workspaces in response to this event, so the stub has to deliver one
+      // or the list never populates.
+      onAuthStateChange: (handler: (event: string, session: unknown) => void) => {
+        handler("INITIAL_SESSION", { access_token: "jwt", user: { id: "user-1" } });
+        return { data: { subscription: { unsubscribe: vi.fn() } } };
+      },
+    },
+  }),
 }));
 
 const { ApiError } = await import("@/lib/api");

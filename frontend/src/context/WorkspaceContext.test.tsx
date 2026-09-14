@@ -13,6 +13,16 @@ const { getWorkspaces, createWorkspace, deleteWorkspace } = vi.hoisted(() => ({
   deleteWorkspace: vi.fn(),
 }));
 
+// A silent subscription: these tests call fetchWorkspaces() explicitly, so an
+// emitting stub would fire a second, racing fetch.
+vi.mock("@/lib/supabase/client", () => ({
+  createClient: () => ({
+    auth: {
+      onAuthStateChange: () => ({ data: { subscription: { unsubscribe: () => {} } } }),
+    },
+  }),
+}));
+
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return { ...actual, getWorkspaces, createWorkspace, deleteWorkspace };

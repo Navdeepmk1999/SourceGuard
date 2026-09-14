@@ -88,9 +88,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
       ...init,
+      // authHeaders spread LAST so a caller's `headers` cannot overwrite the
+      // Authorization bearer. Every RLS policy on the backend keys off the
+      // user id in that token, so a dropped header is not an auth failure the
+      // user sees - it is a request evaluated against no tenant at all.
       headers: isFormData
-        ? { ...authHeaders, ...init?.headers }
-        : { "Content-Type": "application/json", ...authHeaders, ...init?.headers },
+        ? { ...init?.headers, ...authHeaders }
+        : { "Content-Type": "application/json", ...init?.headers, ...authHeaders },
     });
   } catch (cause) {
     throw new ApiError(

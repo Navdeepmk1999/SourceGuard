@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   FolderKanban,
@@ -59,11 +59,12 @@ export function Sidebar() {
     addWorkspace,
     setActiveWorkspace,
     removeWorkspace,
+    clearWorkspaces,
   } = useWorkspaces();
 
-  useEffect(() => {
-    void fetchWorkspaces();
-  }, [fetchWorkspaces]);
+  // No mount-time fetch here: WorkspaceProvider now loads workspaces in
+  // response to Supabase's INITIAL_SESSION/SIGNED_IN events, so fetching here
+  // too would duplicate every request and could race a sign-out.
 
   async function handleCreateWorkspace() {
     const name = window.prompt("Name your new workspace:")?.trim();
@@ -78,6 +79,11 @@ export function Sidebar() {
     try {
       const supabase = createClient();
       await supabase.auth.signOut();
+      // Belt and braces: onAuthStateChange("SIGNED_OUT") already wipes this,
+      // but that fires asynchronously and the redirect below could lose the
+      // race on a slow render. Clearing here means no frame can paint the
+      // previous user's workspaces.
+      clearWorkspaces();
       router.push("/login");
       router.refresh();
     } finally {
