@@ -1,9 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
-import { ShieldCheck } from "lucide-react";
+import { Eye, EyeOff, ShieldCheck } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 
@@ -14,6 +14,9 @@ export default function LoginPage() {
   const [mode, setMode] = useState<Mode>("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const confirmPasswordRef = useRef<HTMLInputElement>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmationSent, setConfirmationSent] = useState(false);
@@ -99,6 +102,19 @@ export default function LoginPage() {
         router.push("/");
         router.refresh();
       } else {
+        if (password !== confirmPassword) {
+          // Checked before the network call: Supabase has no concept of a
+          // confirmation field, so sending a mistyped password would create a
+          // real account the user cannot sign in to.
+          //
+          // No banner here - the inline message under the field already says
+          // this, and duplicating it puts the same sentence on screen twice.
+          // Focus moves to the offending field instead, which is the more
+          // useful outcome and the one a screen reader announces.
+          confirmPasswordRef.current?.focus();
+          return;
+        }
+
         const { data, error: signUpError } = await supabase.auth.signUp({
           email,
           password,
@@ -143,6 +159,10 @@ export default function LoginPage() {
               setMode("login");
               setError(null);
               setConfirmationSent(false);
+              // Dropped on every mode switch: a stale value would otherwise
+              // sit hidden behind the login form and reappear - already
+              // mismatched - the next time signup is opened.
+              setConfirmPassword("");
             }}
             className={cn(
               "flex-1 rounded-md py-1.5 font-medium transition-colors",
@@ -157,6 +177,10 @@ export default function LoginPage() {
               setMode("signup");
               setError(null);
               setConfirmationSent(false);
+              // Dropped on every mode switch: a stale value would otherwise
+              // sit hidden behind the login form and reappear - already
+              // mismatched - the next time signup is opened.
+              setConfirmPassword("");
             }}
             className={cn(
               "flex-1 rounded-md py-1.5 font-medium transition-colors",
@@ -188,18 +212,62 @@ export default function LoginPage() {
             <label htmlFor="password" className="text-xs font-medium text-zinc-400">
               Password
             </label>
-            <input
-              id="password"
-              type="password"
-              required
-              minLength={6}
-              autoComplete={mode === "login" ? "current-password" : "new-password"}
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              className="rounded-md border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-indigo-500 focus:outline-none"
-              placeholder="••••••••"
-            />
+            <div className="relative">
+              <input
+                id="password"
+                type={showPassword ? "text" : "password"}
+                required
+                minLength={6}
+                autoComplete={mode === "login" ? "current-password" : "new-password"}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                className="w-full rounded-md border border-zinc-800 bg-zinc-900 px-3 py-2 pr-10 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-indigo-500 focus:outline-none"
+                placeholder="••••••••"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((visible) => !visible)}
+                // aria-label rather than a title alone: the control has no
+                // text, and its meaning inverts with state.
+                aria-label={showPassword ? "Hide password" : "Show password"}
+                aria-pressed={showPassword}
+                className="absolute inset-y-0 right-0 flex items-center px-3 text-zinc-500 transition-colors hover:text-zinc-300"
+              >
+                {showPassword ? (
+                  <EyeOff className="h-4 w-4" aria-hidden />
+                ) : (
+                  <Eye className="h-4 w-4" aria-hidden />
+                )}
+              </button>
+            </div>
           </div>
+
+          {mode === "signup" && (
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="confirm-password" className="text-xs font-medium text-zinc-400">
+                Confirm Password
+              </label>
+              <input
+                id="confirm-password"
+                ref={confirmPasswordRef}
+                // Intentionally follows the same toggle. Revealing one field
+                // while masking the other defeats the point of the toggle,
+                // which exists so the user can check what they typed.
+                type={showPassword ? "text" : "password"}
+                required
+                minLength={6}
+                autoComplete="new-password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+                aria-invalid={Boolean(confirmPassword) && confirmPassword !== password}
+                className="rounded-md border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-indigo-500 focus:outline-none"
+                placeholder="••••••••"
+              />
+              {confirmPassword && confirmPassword !== password && (
+                <p className="text-xs text-amber-400">Passwords do not match.</p>
+              )}
+            </div>
+          )}
 
           {error && (
             <p className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">

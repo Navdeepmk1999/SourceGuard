@@ -1,14 +1,16 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import ensure_workspace_owner, get_authenticated_db, get_current_user
 from app.models import Document, DocumentChunk, Workspace
+from app.schemas.chat import ChatMessageRead, WorkspaceHistoryRead
 from app.schemas.document import DeletionResult, DocumentRead
 from app.schemas.workspace import WorkspaceCreate, WorkspaceRead
+from app.services import conversation
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["workspaces"])
 
@@ -121,4 +123,36 @@ async def delete_workspace(
         id=workspace_id,
         deleted_documents=document_count or 0,
         deleted_chunks=chunk_count or 0,
+    )
+
+
+@router.get("/{workspace_id}/history", response_model=WorkspaceHistoryRead)
+async def get_workspace_history(
+    workspace_id: uuid.UUID,
+    limit: int = Query(default=50, ge=1, le=200),
+    session: AsyncSession = Depends(get_authenticated_db),
+    user_id: uuid.UUID = Depends(get_current_user),
+) -> WorkspaceHistoryRead:
+    """Replays a workspace's most recent conversation.
+
+    Separate from the model's memory window on purpose. `HISTORY_WINDOW_SIZE`
+    (10) bounds what is fed to the LLM to control prompt size and cost; this
+    default of 50 bounds what a person sees when they reopen a workspace.
+    Tying the two together would mean shrinking the prompt budget also erased
+    the user's visible scrollback.
+    """
+    workspace = await session.get(Workspace, workspace_id)
+    ensure_workspace_owner(workspace, user_id)
+
+    chat_session = await conversation.get_latest_session(session, workspace_id, user_id)
+    if chat_session is None:
+        # Never used. Not a 404 - the workspace exists and simply has no
+        # conversation yet, which the client renders as an empty thread.
+        return WorkspaceHistoryRead(workspace_id=workspace_id, session_id=None, messages=[])
+
+    messages = await conversation.load_recent_messages(session, chat_session.id, limit=limit)
+    return WorkspaceHistoryRead(
+        workspace_id=workspace_id,
+        session_id=chat_session.id,
+        messages=[ChatMessageRead.model_validate(message) for message in messages],
     )

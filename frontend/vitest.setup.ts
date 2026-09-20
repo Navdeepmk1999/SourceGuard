@@ -10,3 +10,12 @@ import { afterEach } from "vitest";
 afterEach(() => {
   cleanup();
 });
+
+// jsdom implements no layout, so Element.prototype.scrollTo does not exist and
+// any component that auto-scrolls (ChatPanel follows streamed tokens) throws
+// on render. Stubbed globally rather than per-test: the call is a no-op for
+// assertions either way, and its absence is a jsdom gap, not a behaviour
+// worth reproducing.
+if (!Element.prototype.scrollTo) {
+  Element.prototype.scrollTo = function scrollTo() {};
+}

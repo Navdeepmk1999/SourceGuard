@@ -105,3 +105,39 @@ export interface DeletionResult {
   deleted_documents: number;
   deleted_chunks: number;
 }
+
+export type ChatRole = "user" | "assistant";
+
+/** One persisted turn replayed from the backend. */
+export interface ChatMessageRead {
+  id: string;
+  role: ChatRole;
+  content: string;
+  created_at: string;
+  /**
+   * Stored verification verdicts.
+   *
+   * `null` means none were stored - a user turn, or an assistant turn from
+   * before verdicts were persisted. That is deliberately distinct from `[]`,
+   * which means "verified, and nothing was flagged". Rendering them the same
+   * way would relabel an unverified answer as clean.
+   */
+  claims: ClaimVerification[] | null;
+  /** Derived server-side from `claims`; null whenever `claims` is null. */
+  overall_score: number | null;
+  is_fully_supported: boolean | null;
+}
+
+/**
+ * A workspace's most recent conversation.
+ *
+ * `session_id` matters as much as the messages: it is what lets the next
+ * question continue the same thread. Without sending it back, the backend
+ * opens a new session and answers with no memory of what is on screen.
+ * Null when the workspace has never been used.
+ */
+export interface WorkspaceHistory {
+  workspace_id: string;
+  session_id: string | null;
+  messages: ChatMessageRead[];
+}

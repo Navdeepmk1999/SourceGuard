@@ -7,6 +7,7 @@ import type {
   EntailmentLabel,
   Workspace,
   WorkspaceDocument,
+  WorkspaceHistory,
 } from "@/types";
 
 // Already includes the `/api/v1` prefix (see frontend/.env.local), so route
@@ -181,6 +182,23 @@ export function deleteDocument(documentId: string): Promise<DeletionResult> {
 /** Deletes a workspace and, by cascade, its documents, chunks, and chat history. */
 export function deleteWorkspace(workspaceId: string): Promise<DeletionResult> {
   return request<DeletionResult>(`/workspaces/${workspaceId}`, { method: "DELETE" });
+}
+
+/**
+ * Replays a workspace's most recent conversation.
+ *
+ * Rejects with `ApiError(404)` for an unknown workspace or one belonging to
+ * another user. A workspace that has never been used is a 200 with a null
+ * `session_id` and no messages, not a 404.
+ */
+export function getWorkspaceHistory(
+  workspaceId: string,
+  limit?: number
+): Promise<WorkspaceHistory> {
+  const query = limit ? `?limit=${limit}` : "";
+  return request<WorkspaceHistory>(`/workspaces/${workspaceId}/history${query}`, {
+    method: "GET",
+  });
 }
 
 /** Rejects with `ApiError(404)` for an unknown `workspaceId`. */

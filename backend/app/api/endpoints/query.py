@@ -93,11 +93,26 @@ async def _stream_query_events(
     await generation_service.aclose()
 
     full_answer = "".join(answer_tokens)
-    await conversation.save_message(
+    assistant_message = await conversation.save_message(
         session, chat_session_id, MessageRole.ASSISTANT, full_answer
     )
 
     verification = _verify_answer(full_answer, context_texts)
+    # Stored so reopening this workspace replays the audit log rather than
+    # showing the answer stripped of every verdict.
+    await conversation.attach_claims(
+        session,
+        assistant_message,
+        [
+            {
+                "claim": claim.claim,
+                "label": claim.label.value,
+                "score": claim.score,
+                "supporting_chunk_index": claim.supporting_chunk_index,
+            }
+            for claim in verification.claims
+        ],
+    )
     for claim in verification.claims:
         yield {
             "event": "verification",

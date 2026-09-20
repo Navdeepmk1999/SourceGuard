@@ -28,9 +28,21 @@ function button(name: RegExp, type: "submit" | "button") {
     .find((element) => (element as HTMLButtonElement).type === type) as HTMLButtonElement;
 }
 
+async function signUpWith(
+  user: ReturnType<typeof userEvent.setup>,
+  password: string,
+  confirmation: string
+) {
+  await user.click(button(/^sign up$/i, "button"));
+  await user.type(screen.getByLabelText(/email/i), "new@example.com");
+  await user.type(screen.getByLabelText(/^password$/i), password);
+  await user.type(screen.getByLabelText(/confirm password/i), confirmation);
+  await user.click(button(/^sign up$/i, "submit"));
+}
+
 async function submitLogin(user: ReturnType<typeof userEvent.setup>) {
   await user.type(screen.getByLabelText(/email/i), "alex@example.com");
-  await user.type(screen.getByLabelText(/password/i), "hunter2hunter2");
+  await user.type(screen.getByLabelText(/^password$/i), "hunter2hunter2");
   await user.click(button(/^log in$/i, "submit"));
 }
 
@@ -136,10 +148,7 @@ describe("LoginPage", () => {
     const user = userEvent.setup();
     render(<LoginPage />);
 
-    await user.click(button(/^sign up$/i, "button"));
-    await user.type(screen.getByLabelText(/email/i), "new@example.com");
-    await user.type(screen.getByLabelText(/password/i), "hunter2hunter2");
-    await user.click(button(/^sign up$/i, "submit"));
+    await signUpWith(user, "hunter2hunter2", "hunter2hunter2");
 
     expect(await screen.findByText(/check your email to confirm/i)).toBeInTheDocument();
     expect(
@@ -153,10 +162,7 @@ describe("LoginPage", () => {
     signUp.mockResolvedValue({ data: { session: { access_token: "jwt" } }, error: null });
     render(<LoginPage />);
 
-    await user.click(button(/^sign up$/i, "button"));
-    await user.type(screen.getByLabelText(/email/i), "new@example.com");
-    await user.type(screen.getByLabelText(/password/i), "hunter2hunter2");
-    await user.click(button(/^sign up$/i, "submit"));
+    await signUpWith(user, "hunter2hunter2", "hunter2hunter2");
 
     await waitFor(() => expect(push).toHaveBeenCalledWith("/"));
   });
@@ -171,5 +177,109 @@ describe("LoginPage", () => {
     expect(await screen.findByText(/unable to reach supabase/i)).toBeInTheDocument();
     // The form must become usable again rather than staying stuck on "wait".
     await waitFor(() => expect(button(/^log in$/i, "submit")).toBeEnabled());
+  });
+  describe("password visibility", () => {
+    it("masks the password by default", () => {
+      render(<LoginPage />);
+      expect(screen.getByLabelText(/^password$/i)).toHaveAttribute("type", "password");
+    });
+
+    it("reveals and re-masks the password on toggle", async () => {
+      const user = userEvent.setup();
+      render(<LoginPage />);
+      const field = screen.getByLabelText(/^password$/i);
+
+      await user.click(screen.getByRole("button", { name: /show password/i }));
+      expect(field).toHaveAttribute("type", "text");
+
+      // The control's meaning inverts, so its label must invert with it.
+      await user.click(screen.getByRole("button", { name: /hide password/i }));
+      expect(field).toHaveAttribute("type", "password");
+    });
+
+    it("reveals both fields together in signup mode", async () => {
+      const user = userEvent.setup();
+      render(<LoginPage />);
+      await user.click(button(/^sign up$/i, "button"));
+
+      await user.click(screen.getByRole("button", { name: /show password/i }));
+
+      // Revealing one while masking the other defeats the purpose: the toggle
+      // exists so the user can check what they typed.
+      expect(screen.getByLabelText(/^password$/i)).toHaveAttribute("type", "text");
+      expect(screen.getByLabelText(/confirm password/i)).toHaveAttribute("type", "text");
+    });
+
+    it("does not toggle the form's submit state", async () => {
+      const user = userEvent.setup();
+      render(<LoginPage />);
+
+      await user.click(screen.getByRole("button", { name: /show password/i }));
+
+      // type="button", so it must never submit the form.
+      expect(signInWithPassword).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("password confirmation", () => {
+    it("has no confirm field in login mode", () => {
+      render(<LoginPage />);
+      expect(screen.queryByLabelText(/confirm password/i)).not.toBeInTheDocument();
+    });
+
+    it("blocks signup when the passwords differ", async () => {
+      const user = userEvent.setup();
+      render(<LoginPage />);
+
+      await signUpWith(user, "hunter2hunter2", "hunter2different");
+
+      // Checked before the network call: Supabase has no confirmation
+      // concept, so a mistyped password would create a real account the user
+      // cannot sign in to.
+      expect(signUp).not.toHaveBeenCalled();
+      // One message, not two: the inline hint is the single source of truth,
+      // and focus moves to the field that needs fixing.
+      expect(screen.getAllByText("Passwords do not match.")).toHaveLength(1);
+      expect(screen.getByLabelText(/confirm password/i)).toHaveFocus();
+    });
+
+    it("warns inline as soon as the confirmation diverges", async () => {
+      const user = userEvent.setup();
+      render(<LoginPage />);
+      await user.click(button(/^sign up$/i, "button"));
+
+      await user.type(screen.getByLabelText(/^password$/i), "hunter2hunter2");
+      await user.type(screen.getByLabelText(/confirm password/i), "hunter2x");
+
+      expect(screen.getByText("Passwords do not match.")).toBeInTheDocument();
+      expect(screen.getByLabelText(/confirm password/i)).toHaveAttribute("aria-invalid", "true");
+    });
+
+    it("proceeds when the passwords match", async () => {
+      const user = userEvent.setup();
+      render(<LoginPage />);
+
+      await signUpWith(user, "hunter2hunter2", "hunter2hunter2");
+
+      await waitFor(() =>
+        expect(signUp).toHaveBeenCalledWith({
+          email: "new@example.com",
+          password: "hunter2hunter2",
+        })
+      );
+    });
+
+    it("clears the confirmation when switching back to login", async () => {
+      const user = userEvent.setup();
+      render(<LoginPage />);
+      await user.click(button(/^sign up$/i, "button"));
+      await user.type(screen.getByLabelText(/confirm password/i), "stale-value");
+
+      await user.click(button(/^log in$/i, "button"));
+      await user.click(button(/^sign up$/i, "button"));
+
+      // A stale value would reappear already mismatched.
+      expect(screen.getByLabelText(/confirm password/i)).toHaveValue("");
+    });
   });
 });

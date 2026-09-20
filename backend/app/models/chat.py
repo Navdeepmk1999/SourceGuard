@@ -2,7 +2,8 @@ import enum
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Text, Uuid, func
+from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Text, Uuid, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -55,6 +56,21 @@ class ChatMessage(Base):
         nullable=False,
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Per-claim verification verdicts for an assistant turn, as
+    # [{claim, label, score, supporting_chunk_index}, ...].
+    #
+    # Persisted because the audit log is the product: without this, reopening
+    # a workspace replayed the answers with no verdicts, which reads as
+    # "unverified" rather than "verdicts not stored".
+    #
+    # NULL on user turns and on assistant turns written before this column
+    # existed - deliberately distinct from [], which means "verified, and
+    # nothing was flagged". Aggregates (overall_score, is_fully_supported) are
+    # derived on read via nli_verifier.aggregate_claims rather than stored, so
+    # they cannot disagree with the claims they summarise.
+    claims: Mapped[list | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
     # Python-side default with microsecond precision, NOT server_default=func.now().
     # Conversation ordering depends on this column, and SQLite's now() resolves
     # only to the second - sibling messages written in the same request would

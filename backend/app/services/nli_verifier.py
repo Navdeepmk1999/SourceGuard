@@ -31,6 +31,20 @@ class ClaimVerification:
     supporting_chunk_index: int | None
 
 
+def aggregate_claims(claims: list["ClaimVerification"]) -> tuple[float, bool]:
+    """Rolls per-claim verdicts up into the headline score and flag.
+
+    Extracted because two callers need it: live verification, and replaying a
+    stored conversation. Only the claims themselves are persisted - these are
+    derived - so a second copy of the formula would silently drift and make a
+    restored answer score differently from the one the user originally saw.
+    """
+    if not claims:
+        return 0.0, False
+    overall = sum(claim.score for claim in claims) / len(claims)
+    return round(overall, 4), all(claim.label == EntailmentLabel.ENTAILED for claim in claims)
+
+
 @dataclass
 class VerificationResult:
     claims: list[ClaimVerification]
@@ -115,14 +129,9 @@ class NLIVerifierService:
         claims = self.decompose_claims(answer)
         claim_verifications = [self.verify_claim(claim, source_chunks) for claim in claims]
 
-        if not claim_verifications:
-            return VerificationResult(claims=[], overall_score=0.0, is_fully_supported=False)
-
-        overall_score = sum(cv.score for cv in claim_verifications) / len(claim_verifications)
-        is_fully_supported = all(cv.label == EntailmentLabel.ENTAILED for cv in claim_verifications)
-
+        overall_score, is_fully_supported = aggregate_claims(claim_verifications)
         return VerificationResult(
             claims=claim_verifications,
-            overall_score=round(overall_score, 4),
+            overall_score=overall_score,
             is_fully_supported=is_fully_supported,
         )

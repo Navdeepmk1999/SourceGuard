@@ -940,3 +940,352 @@ class TestIngestionFailureReporting:
                     status=DocumentStatus.COMPLETED,
                     chunk_count=5,
                 )
+
+
+class TestWorkspaceHistory:
+    """GET /workspaces/{id}/history — replays a workspace's conversation."""
+
+    async def _seed_session(self, client, session_maker, turns, created_at=None):
+        ws = await client.post("/api/v1/workspaces", json={"name": f"H {uuid.uuid4()}"})
+        workspace_id = uuid.UUID(ws.json()["id"])
+        chat_session_id = uuid.uuid4()
+
+        async with session_maker() as session:
+            session.add(
+                ChatSession(
+                    id=chat_session_id,
+                    workspace_id=workspace_id,
+                    user_id=_TEST_USER_ID,
+                    created_at=created_at or datetime.now(UTC),
+                )
+            )
+            await session.flush()
+            base = datetime.now(UTC)
+            for index, (role, content) in enumerate(turns):
+                session.add(
+                    ChatMessage(
+                        id=uuid.uuid4(),
+                        session_id=chat_session_id,
+                        role=role,
+                        content=content,
+                        created_at=base + timedelta(seconds=index),
+                    )
+                )
+            await session.commit()
+        return workspace_id, chat_session_id
+
+    async def test_returns_messages_in_chronological_order(self, client, session_maker):
+        workspace_id, chat_session_id = await self._seed_session(
+            client,
+            session_maker,
+            [
+                (MessageRole.USER, "first question"),
+                (MessageRole.ASSISTANT, "first answer"),
+                (MessageRole.USER, "second question"),
+            ],
+        )
+
+        response = await client.get(f"/api/v1/workspaces/{workspace_id}/history")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [m["content"] for m in body["messages"]] == [
+            "first question",
+            "first answer",
+            "second question",
+        ]
+        assert [m["role"] for m in body["messages"]] == ["user", "assistant", "user"]
+
+    async def test_returns_the_session_id_so_the_thread_can_continue(
+        self, client, session_maker
+    ):
+        """The session id is the point of this endpoint.
+
+        Without it the client would render the restored turns and then open a
+        *new* session on the next question, so the model would answer with no
+        memory of anything visible on screen.
+        """
+        workspace_id, chat_session_id = await self._seed_session(
+            client, session_maker, [(MessageRole.USER, "hello")]
+        )
+
+        body = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()
+
+        assert body["session_id"] == str(chat_session_id)
+        assert body["workspace_id"] == str(workspace_id)
+
+    async def test_unused_workspace_returns_an_empty_thread_not_404(self, client):
+        ws = await client.post("/api/v1/workspaces", json={"name": f"Fresh {uuid.uuid4()}"})
+        workspace_id = ws.json()["id"]
+
+        response = await client.get(f"/api/v1/workspaces/{workspace_id}/history")
+
+        # The workspace exists and simply has no conversation yet.
+        assert response.status_code == 200
+        assert response.json() == {
+            "workspace_id": workspace_id,
+            "session_id": None,
+            "messages": [],
+        }
+
+    async def test_replays_only_the_most_recent_session(self, client, session_maker):
+        """Sessions are separate conversations, not one continuous log.
+
+        Concatenating them would splice unrelated threads together and feed
+        the model a history it never produced.
+        """
+        workspace_id, _old = await self._seed_session(
+            client,
+            session_maker,
+            [(MessageRole.USER, "old conversation")],
+            created_at=datetime.now(UTC) - timedelta(days=1),
+        )
+        newer_id = uuid.uuid4()
+        async with session_maker() as session:
+            session.add(
+                ChatSession(
+                    id=newer_id,
+                    workspace_id=workspace_id,
+                    user_id=_TEST_USER_ID,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            await session.flush()
+            session.add(
+                ChatMessage(
+                    id=uuid.uuid4(),
+                    session_id=newer_id,
+                    role=MessageRole.USER,
+                    content="new conversation",
+                    created_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+
+        body = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()
+
+        assert body["session_id"] == str(newer_id)
+        assert [m["content"] for m in body["messages"]] == ["new conversation"]
+
+    async def test_limit_is_independent_of_the_model_window(self, client, session_maker):
+        """HISTORY_WINDOW_SIZE bounds the prompt; this bounds what a user sees.
+
+        Tying them together would mean shrinking the prompt budget also erased
+        the visible scrollback.
+        """
+        from app.services.conversation import HISTORY_WINDOW_SIZE
+
+        turns = [(MessageRole.USER, f"turn {i}") for i in range(HISTORY_WINDOW_SIZE + 5)]
+        workspace_id, _ = await self._seed_session(client, session_maker, turns)
+
+        body = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()
+        assert len(body["messages"]) == HISTORY_WINDOW_SIZE + 5
+
+        capped = (await client.get(f"/api/v1/workspaces/{workspace_id}/history?limit=3")).json()
+        assert len(capped["messages"]) == 3
+        # Newest kept, oldest dropped, still chronological.
+        assert capped["messages"][-1]["content"] == f"turn {HISTORY_WINDOW_SIZE + 4}"
+
+    async def test_another_users_workspace_is_404(self, client, session_maker):
+        workspace_id, _ = await self._seed_session(
+            client, session_maker, [(MessageRole.USER, "private")]
+        )
+
+        other = uuid.uuid4()
+        app.dependency_overrides[get_current_user] = lambda: other
+        try:
+            response = await client.get(f"/api/v1/workspaces/{workspace_id}/history")
+        finally:
+            app.dependency_overrides[get_current_user] = lambda: _TEST_USER_ID
+
+        assert response.status_code == 404
+
+    async def test_rejects_an_out_of_range_limit(self, client):
+        ws = await client.post("/api/v1/workspaces", json={"name": f"L {uuid.uuid4()}"})
+        response = await client.get(f"/api/v1/workspaces/{ws.json()['id']}/history?limit=0")
+        assert response.status_code == 422
+
+
+class TestClaimPersistence:
+    """Verification verdicts must survive a reload.
+
+    The audit log is the product: an answer replayed without its verdicts
+    reads as unverified, which is a stronger and wronger claim than "verdicts
+    were not stored".
+    """
+
+    async def _seed_assistant_turn(self, client, session_maker, claims):
+        ws = await client.post("/api/v1/workspaces", json={"name": f"C {uuid.uuid4()}"})
+        workspace_id = uuid.UUID(ws.json()["id"])
+        chat_session_id = uuid.uuid4()
+        async with session_maker() as session:
+            session.add(
+                ChatSession(
+                    id=chat_session_id,
+                    workspace_id=workspace_id,
+                    user_id=_TEST_USER_ID,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            await session.flush()
+            session.add(
+                ChatMessage(
+                    id=uuid.uuid4(),
+                    session_id=chat_session_id,
+                    role=MessageRole.ASSISTANT,
+                    content="Revenue was 4.2M.",
+                    claims=claims,
+                    created_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+        return workspace_id
+
+    async def test_history_replays_stored_claims(self, client, session_maker):
+        workspace_id = await self._seed_assistant_turn(
+            client,
+            session_maker,
+            [
+                {"claim": "Revenue was 4.2M.", "label": "entailed", "score": 0.9,
+                 "supporting_chunk_index": 1},
+                {"claim": "Growth was 12%.", "label": "not_entailed", "score": 0.4,
+                 "supporting_chunk_index": None},
+            ],
+        )
+
+        body = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()
+        message = body["messages"][0]
+
+        assert [c["label"] for c in message["claims"]] == ["entailed", "not_entailed"]
+        assert message["claims"][0]["score"] == 0.9
+
+    async def test_aggregates_are_derived_not_stored(self, client, session_maker):
+        """Recomputed on read, so a summary can never disagree with its claims."""
+        workspace_id = await self._seed_assistant_turn(
+            client,
+            session_maker,
+            [
+                {"claim": "a", "label": "entailed", "score": 1.0, "supporting_chunk_index": 0},
+                {"claim": "b", "label": "not_entailed", "score": 0.4, "supporting_chunk_index": None},
+            ],
+        )
+
+        message = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()[
+            "messages"
+        ][0]
+
+        assert message["overall_score"] == 0.7
+        assert message["is_fully_supported"] is False
+
+    async def test_all_entailed_reads_as_fully_supported(self, client, session_maker):
+        workspace_id = await self._seed_assistant_turn(
+            client,
+            session_maker,
+            [{"claim": "a", "label": "entailed", "score": 0.8, "supporting_chunk_index": 0}],
+        )
+
+        message = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()[
+            "messages"
+        ][0]
+
+        assert message["is_fully_supported"] is True
+
+    async def test_null_claims_stay_null_and_are_not_reported_as_clean(
+        self, client, session_maker
+    ):
+        """NULL means "not stored"; [] means "verified, nothing flagged".
+
+        Collapsing them would relabel an unverified answer as clean, which is
+        exactly the false assurance this product exists to prevent.
+        """
+        workspace_id = await self._seed_assistant_turn(client, session_maker, None)
+
+        message = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()[
+            "messages"
+        ][0]
+
+        assert message["claims"] is None
+        assert message["overall_score"] is None
+        assert message["is_fully_supported"] is None
+
+    async def test_empty_claims_are_distinct_from_null(self, client, session_maker):
+        workspace_id = await self._seed_assistant_turn(client, session_maker, [])
+
+        message = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()[
+            "messages"
+        ][0]
+
+        assert message["claims"] == []
+        assert message["overall_score"] == 0.0
+        assert message["is_fully_supported"] is False
+
+    async def _ask(self, client, session_maker, workspace_id):
+        """Seeds retrievable context, then streams one query to completion.
+
+        A chunk is required, not optional: with no context the endpoint emits
+        an error and returns *before* persisting anything, so the turn under
+        test would never exist.
+
+        The retriever itself is stubbed because the real one emits pgvector's
+        `<=>` operator, which SQLite cannot parse - the same reason the
+        conversation memory tests stub it.
+        """
+        document_id, chunk_id = uuid.uuid4(), uuid.uuid4()
+        async with session_maker() as session:
+            session.add(
+                Document(
+                    id=document_id,
+                    workspace_id=uuid.UUID(str(workspace_id)),
+                    filename="report.pdf",
+                    document_type="pdf",
+                    status="completed",
+                )
+            )
+            await session.flush()
+            session.add(
+                DocumentChunk(
+                    id=chunk_id,
+                    document_id=document_id,
+                    content="Revenue was 4.2M in the third quarter.",
+                    chunk_index=0,
+                    embedding=None,
+                    chunk_metadata={},
+                )
+            )
+            await session.commit()
+
+        app.dependency_overrides[get_hybrid_retriever] = lambda: _StubRetriever([chunk_id])
+        try:
+            async with client.stream(
+                "POST",
+                "/api/v1/query/stream",
+                json={"workspace_id": str(workspace_id), "query": "What was revenue?"},
+            ) as response:
+                assert response.status_code == 200
+                async for _ in response.aiter_text():
+                    pass
+        finally:
+            app.dependency_overrides.pop(get_hybrid_retriever, None)
+
+    async def test_streaming_a_query_persists_its_claims(self, client, session_maker):
+        """End to end: ask a question, then reload and find the verdicts."""
+        ws = await client.post("/api/v1/workspaces", json={"name": f"E2E {uuid.uuid4()}"})
+        workspace_id = ws.json()["id"]
+
+        await self._ask(client, session_maker, workspace_id)
+
+        body = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()
+        assistant = [m for m in body["messages"] if m["role"] == "assistant"]
+        assert assistant, "the assistant turn should have been persisted"
+        # Stored by attach_claims after verification, not left NULL.
+        assert assistant[0]["claims"] is not None
+        assert assistant[0]["overall_score"] is not None
+
+    async def test_the_user_turn_carries_no_claims(self, client, session_maker):
+        ws = await client.post("/api/v1/workspaces", json={"name": f"U {uuid.uuid4()}"})
+        workspace_id = ws.json()["id"]
+        await self._ask(client, session_maker, workspace_id)
+
+        body = (await client.get(f"/api/v1/workspaces/{workspace_id}/history")).json()
+        user_turns = [m for m in body["messages"] if m["role"] == "user"]
+        assert user_turns and user_turns[0]["claims"] is None

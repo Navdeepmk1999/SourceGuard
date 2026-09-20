@@ -15,7 +15,7 @@ import {
   ShieldCheck,
   XCircle,
 } from "lucide-react";
-import { ApiError, streamQuery } from "@/lib/api";
+import { ApiError, getWorkspaceHistory, streamQuery } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { ClaimVerification, EntailmentLabel, Workspace } from "@/types";
 
@@ -80,8 +80,67 @@ export function ChatPanel({ workspace }: { workspace: Workspace | null }) {
   const [messages, setMessages] = useState<ChatTurn[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [status, setStatus] = useState<StreamStatus>("idle");
+  // Distinct from `status`: restoring is not a stream, and conflating them
+  // would make the composer look busy when it is merely loading scrollback.
+  const [isRestoring, setIsRestoring] = useState(Boolean(workspace));
+  const [restoreError, setRestoreError] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Replays this workspace's last conversation on mount.
+  //
+  // The component is keyed by workspace id, so switching workspaces remounts
+  // it and this runs once per workspace with no dependency on `workspace.id`
+  // changing underneath.
+  //
+  // Restoring `sessionId` matters as much as the messages: without it the
+  // next question opens a *new* session and the model answers with no memory
+  // of the exchange the user can see on screen.
+  useEffect(() => {
+    if (!workspace) {
+      return;
+    }
+    let cancelled = false;
+
+    async function restore(workspaceId: string) {
+      try {
+        const history = await getWorkspaceHistory(workspaceId);
+        if (cancelled) {
+          return;
+        }
+        setSessionId(history.session_id);
+        setMessages(
+          history.messages.map((message) => ({
+            id: message.id,
+            role: message.role,
+            content: message.content,
+            // `?? undefined` preserves the distinction the backend draws:
+            // null means no verdicts were stored, [] means verified with
+            // nothing flagged. Collapsing null to [] would render an
+            // unverified answer as clean.
+            claims: message.claims ?? undefined,
+            overallScore: message.overall_score,
+            isFullySupported: message.is_fully_supported,
+          }))
+        );
+      } catch (cause) {
+        if (!cancelled) {
+          setRestoreError(
+            cause instanceof ApiError ? cause.message : "Could not load previous messages."
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setIsRestoring(false);
+        }
+      }
+    }
+
+    void restore(workspace.id);
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace]);
 
   const isBusy = status === "loading" || status === "streaming";
   const inputDisabled = !workspace || isBusy;
@@ -100,6 +159,17 @@ export function ChatPanel({ workspace }: { workspace: Workspace | null }) {
   // The audit pane mirrors the most recent assistant turn that produced claims.
   const latestClaims =
     [...messages].reverse().find((m) => m.claims && m.claims.length > 0)?.claims ?? [];
+
+  // A replayed turn from before verdicts were persisted has `claims`
+  // undefined - distinct from an empty array, which means "verified, nothing
+  // flagged". The panel must say which, or an unverified answer reads as a
+  // clean one, and that false assurance is the exact failure this product
+  // exists to prevent.
+  const latestAssistantTurn = [...messages].reverse().find((m) => m.role === "assistant");
+  const verdictsUnavailable =
+    latestClaims.length === 0 &&
+    latestAssistantTurn !== undefined &&
+    latestAssistantTurn.claims === undefined;
 
   function updateTurn(id: string, patch: Partial<ChatTurn>) {
     setMessages((current) =>
@@ -182,7 +252,20 @@ export function ChatPanel({ workspace }: { workspace: Workspace | null }) {
     <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px]">
       <section className="flex min-h-0 flex-col border-r border-zinc-800">
         <div ref={scrollRef} className="flex-1 overflow-y-auto">
-          {messages.length === 0 ? (
+          {restoreError && (
+            <p
+              role="alert"
+              className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-300"
+            >
+              {restoreError} You can still ask a new question.
+            </p>
+          )}
+          {isRestoring ? (
+            <div className="flex h-full items-center justify-center gap-2 text-sm text-zinc-500">
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+              Restoring conversation…
+            </div>
+          ) : messages.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
               <div className="flex h-12 w-12 items-center justify-center rounded-full bg-zinc-900 ring-1 ring-zinc-800">
                 <MessageSquare className="h-5 w-5 text-zinc-500" />
@@ -308,10 +391,17 @@ export function ChatPanel({ workspace }: { workspace: Workspace | null }) {
         {latestClaims.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
             <FileSearch className="h-6 w-6 text-zinc-700" />
-            <p className="text-sm text-zinc-500">
-              Claim-level verification results will appear here in real time as
-              answers are generated.
-            </p>
+            {verdictsUnavailable ? (
+              <p className="text-sm text-zinc-500">
+                Verification results weren&apos;t recorded for this answer. It was
+                generated before verdicts were stored — ask again to verify it.
+              </p>
+            ) : (
+              <p className="text-sm text-zinc-500">
+                Claim-level verification results will appear here in real time as
+                answers are generated.
+              </p>
+            )}
           </div>
         ) : (
           <ul className="flex flex-1 flex-col gap-2 overflow-y-auto p-3">

@@ -77,10 +77,56 @@ def to_prompt_history(messages: list[ChatMessage]) -> list[dict[str, str]]:
 
 
 async def save_message(
-    session: AsyncSession, session_id: uuid.UUID, role: MessageRole, content: str
+    session: AsyncSession,
+    session_id: uuid.UUID,
+    role: MessageRole,
+    content: str,
+    claims: list[dict] | None = None,
 ) -> ChatMessage:
-    """Persists one turn and commits."""
-    message = ChatMessage(session_id=session_id, role=role, content=content)
+    """Persists one turn and commits.
+
+    `claims` stays None for user turns and for assistant turns whose
+    verification has not run yet - see `attach_claims`, which fills it in
+    afterwards.
+    """
+    message = ChatMessage(session_id=session_id, role=role, content=content, claims=claims)
     session.add(message)
     await session.commit()
     return message
+
+
+async def attach_claims(
+    session: AsyncSession, message: ChatMessage, claims: list[dict]
+) -> None:
+    """Records verification verdicts against an already-saved turn.
+
+    A second write, deliberately. The answer is persisted the moment streaming
+    ends, before verification runs, so a failure in the verifier costs the
+    audit trail for that turn rather than the answer itself. Folding both into
+    one write would trade a recoverable gap for a lost response.
+    """
+    message.claims = claims
+    session.add(message)
+    await session.commit()
+
+
+async def get_latest_session(
+    session: AsyncSession, workspace_id: uuid.UUID, user_id: uuid.UUID
+) -> ChatSession | None:
+    """The workspace's most recently created session, or None if never used.
+
+    A workspace accumulates one session per "new conversation", so restoring
+    the UI means picking the newest rather than merging them - concatenating
+    every session would replay unrelated conversations as one thread.
+
+    Scoped by `user_id` as well as workspace: RLS covers this on Postgres, but
+    the application check is what makes the behaviour identical on the SQLite
+    test database, where RLS does not exist.
+    """
+    result = await session.execute(
+        select(ChatSession)
+        .where(ChatSession.workspace_id == workspace_id, ChatSession.user_id == user_id)
+        .order_by(ChatSession.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
