@@ -1,261 +1,258 @@
-# SourceGuard Engineering Worklog
+# SourceGuard — Build Log
 
-## Day 1 - Repository Setup & System Architecture
-- Configured isolated SSH keys and folder-specific Git settings for `Navdeepmk1999`.
-- Initialized core repository structures and authored system directives (`CLAUDE.md`) and system specifications (`DESIGN.md`).
-- Designed multi-tenant PostgreSQL schema supporting `pgvector` extension and hybrid search indexing (HNSW + Full-Text Search).
+A chronological record of how the system was built, including the decisions
+that were reversed and why. Bugs are recorded where they were instructive;
+several of the most useful ones produced no error at all.
 
-## Day 1 (Continued) - Module 1 Implementation
-- Initialized FastAPI backend and created modular service architecture (`app/services`, `app/schemas`).
-- Implemented `document_parser.py` using PyMuPDF to extract text from PDFs and TXT files.
-- Built `chunker.py` using recursive text splitting (800 token chunks, 150 overlap) with precise metadata offset tagging.
-- Detected and mitigated a localized homograph attack (`πthon`) within the virtual environment bin directory.
-- Achieved 100% pass rate across 10 unit tests covering ingestion, chunking limits, and error paths.
-- Hardened `document_parser.py` against path-traversal and disguised-extension filenames, rejecting them with a strict HTTP 400 instead of silently degrading; covered by 6 new security tests (16 passing total).
+---
 
-## Day 2 - Module 2 Implementation (Database & Vector Engine)
-- Wired an async SQLAlchemy engine/session layer (`app/db/session.py`) on `asyncpg`, plus `app/db/init_db.py` to bootstrap the `pgvector` extension and create all tables.
-- Modeled the core relational schema in `app/models/`: `Workspace` → `Document` → `DocumentChunk` (cascade deletes) and a standalone `AuditLog`.
-- Added a portable embedding column type (`PortableVector`, 1536 dimensions) that compiles to native `pgvector.Vector` on Postgres and a JSON-encoded fallback on SQLite, plus a JSON/JSONB variant for chunk and audit metadata, so the same ORM models are exercisable against a mock SQLite DB in tests without a live Postgres instance.
-- Confirmed `DATABASE_URL` loads correctly from `.env` regardless of working directory.
-- Achieved 100% pass rate across 12 new async database tests (relationships, cascade deletes, joins, uniqueness constraints) — 22 tests passing overall.
+## Phase 1 — Core RAG pipeline
 
-## Day 3 - Module 3 Implementation (Verification & Retrieval Core)
-- Built `embeddings.py`: an async embedding service targeting Together AI's OpenAI-compatible endpoint, with dimension validation (1536) on live responses and a deterministic, unit-normalized mock generator (SHA-256-seeded) for offline dev/tests — no torch/transformers download required.
-- Built `retriever.py`: hybrid search combining pgvector cosine-distance ANN search with PostgreSQL full-text search (`tsvector`/`plainto_tsquery`/`ts_rank`), merged via Reciprocal Rank Fusion; query builders are pure functions so SQL generation is unit-testable without a live database.
-- Extended `PortableVector` with pgvector's comparator so `.cosine_distance()` is usable directly on the ORM column for query construction.
-- Built `nli_verifier.py`: decomposes a generated answer into sentence-level claims and scores entailment against source chunks via keyword coverage; strictly enforces regex word-boundaries (`\b`) on every keyword match to prevent partial substring false-positives (e.g. "cat" incorrectly matching inside "category") per the project's regex security rule.
-- Achieved 100% pass rate across 26 new tests (RRF merge logic, hybrid query generation, embedding mock behavior, claim decomposition, entailment scoring, and the word-boundary regression case) — 48 tests passing overall.
+**Foundation.** FastAPI with async SQLAlchemy 2.0, Pydantic v2 schemas, and a
+module layout separating routes, services, models, and schemas. PostgreSQL
+with `pgvector` for embeddings alongside relational metadata — one database
+rather than a separate vector store, so chunks and their parent documents
+commit in a single transaction and a partially-ingested document is
+impossible.
 
-## Day 4 - Module 4 Implementation (API & Streaming Gateway)
-- Added `app/api/endpoints/`: `workspaces.py` (workspace creation, 409 on duplicate names), `documents.py` (multi-file upload wired to Module 1's `DocumentParser` + Module 3's `EmbeddingService`, 404 on unknown workspace), and `query.py` (SSE endpoint streaming answer tokens then NLI verification scores).
-- Added `generation.py`: a small Groq-backed streaming token service (live SSE parsing when `GROQ_API_KEY` is set, deterministic mock stream otherwise) — needed to produce the "LLM generation tokens" the streaming endpoint yields, since no generation service existed yet from prior modules.
-- Introduced `app/api/deps.py` with an overridable `get_hybrid_retriever` dependency so `/query/stream` can be integration-tested without a live Postgres/pgvector instance — the retriever is swapped for a stub in tests while chunk content is still fetched from a real (in-memory) DB via a portable `WHERE id IN (...)` query.
-- Wired all routers into `app/main.py` behind a strict `CORSMiddleware` policy (explicit allow-listed origins from `.env`, restricted methods/headers, no wildcard).
-- Achieved 100% pass rate across 10 new integration tests (workspace creation/conflict, upload success/invalid-extension/path-traversal/unknown-workspace rejection, SSE event structure, empty-context handling) — 58 tests passing overall.
+**Portable vectors.** The test suite needed to run without a live PostgreSQL.
+Rather than maintain a parallel mock schema, `PortableVector` was written as a
+`TypeDecorator` that compiles to a native `VECTOR(n)` column on PostgreSQL and
+a JSON-encoded `Text` column elsewhere. Tests exercise the real production
+models; the seam is one class.
 
-## Day 5 - Frontend Initialization & UI Shell
-- Scaffolded the Next.js 14+ (App Router) frontend under `frontend/src/`, relocating the CLI-generated `app/` directory to `src/app/` per Next.js's `src`-folder convention and repointing the `@/*` TypeScript path alias (`tsconfig.json`) at `./src/*` accordingly.
-- Integrated Tailwind CSS (v4, CSS-first config via `@theme inline` — no `tailwind.config.js`) and Lucide React; wired `clsx` + `tailwind-merge` into a single `cn()` composition helper (`src/lib/utils.ts`) used by every component with conditional/collapsed styling.
-- Established a fixed dark-mode-default layout (`src/app/layout.tsx`): `zinc-950`/`zinc-100` base palette applied directly (no `prefers-color-scheme` branching), Geist Sans/Mono fonts, and a persistent `Sidebar` alongside the routed content region.
-- Built a collapsible `Sidebar` (`src/components/Sidebar.tsx`, Client Component): icon-only collapsed rail, a "New Workspace" affordance, and a "Workspaces" section with an explicit empty state — scoped for a future `GET /api/v1/workspaces` fetch (Module 4's endpoint), not called yet.
-- Replaced the CLI boilerplate `src/app/page.tsx` with a two-pane dashboard shell: a Chat/Query panel (disabled input, empty state) and a Verification Audit Log panel, structurally anticipating the `POST /api/v1/query/stream` SSE contract (`token` / `verification` / `done` events) without consuming it.
-- Mirrored backend contracts into `src/types/index.ts`: `Workspace`, `Document`, `DocumentChunk` typed from `app/models/*.py` (SQLAlchemy), and `VerificationResult`/`ClaimVerification` typed field-for-field from `app/services/nli_verifier.py`'s dataclasses.
-- Verified the shell end-to-end with zero warnings: `tsc --noEmit`, `eslint .`, and `next build` (Turbopack) all pass clean. No network calls exist anywhere in `frontend/src/` yet — this pass is purely structural.
+**Retrieval.** Dense pgvector cosine search plus PostgreSQL full-text,
+combined by Reciprocal Rank Fusion. RRF was chosen over weighted blending
+because cosine distance and `ts_rank` sit on incomparable scales, and any
+weighting constant would be arbitrary and would drift as the corpus grew.
+Query builders were written as pure functions returning SQL, making them
+unit-testable without a database.
 
-## Day 5 (Continued) - Module 5 Workspace Architecture
-- Closed a backend gap surfaced while building the API client: `app/api/endpoints/workspaces.py` implemented only `POST`, so the planned workspace list had no route to call. Added `list_workspaces()` — `select(Workspace).order_by(Workspace.created_at.desc())` against an injected `AsyncSession`, returning `list[WorkspaceRead]`.
-- Registered the new route at `""` rather than `"/"`: with the router's `/api/v1/workspaces` prefix, `"/"` resolves to `/api/v1/workspaces/` and makes FastAPI issue a `307` redirect for the un-slashed URL the frontend client actually requests — a redirect that also complicates the strict CORS policy. `""` resolves exactly to `/api/v1/workspaces`, matching the existing `POST` convention.
-- Built `src/lib/api.ts`: a native `fetch` client over `NEXT_PUBLIC_API_URL` exposing `getWorkspaces()` and `createWorkspace(name)`, plus an `ApiError` carrying the HTTP `status` (`0` reserved for transport/CORS failures that never reached the server). Response bodies are read once as text and then parsed, so a non-JSON error payload (HTML 404, proxy 502) surfaces the real status instead of an opaque JSON parse error; `extractDetail()` normalizes both FastAPI error shapes (`{"detail": "..."}` and Pydantic's `{"detail": [{"msg": ...}]}`).
-- Built `src/context/WorkspaceContext.tsx`: a `WorkspaceProvider` holding `workspaces` / `activeWorkspace` / `isLoading` / `error` and exposing `fetchWorkspaces`, `addWorkspace`, `setActiveWorkspace`. `addWorkspace` resolves to `Workspace | null` rather than throwing, so a `409` duplicate-name response becomes rendered UI state instead of an unhandled promise rejection; a refetch clears `activeWorkspace` when it no longer exists server-side. Wired into `src/app/layout.tsx` around both the `Sidebar` and the routed `children`.
-- Wired `Sidebar` to the context: fetches on mount, creates via `window.prompt` (placeholder pending a real form), highlights the active workspace through `cn()`, and renders distinct loading / error-with-retry / empty states in place of the previous static placeholder array.
-- Converted `src/app/page.tsx` to a Client Component so the dashboard header reflects `activeWorkspace.name`, falling back to "No workspace selected". Chat and upload surfaces left untouched.
-- Verified both sides: 58 backend tests still pass, the new `GET` route was exercised ad-hoc (empty list, newest-first ordering, correct `WorkspaceRead` keys, no redirect on the un-slashed path), and `tsc --noEmit` / `eslint .` / `next build` all pass clean. Committed regression tests for the new route are still outstanding.
+**Verification.** The differentiating feature: decompose each answer into
+sentence-level claims, score each against the retrieved chunks, and label it.
+Implemented as a deterministic lexical heuristic — keyword coverage with
+word-boundary matching — rather than a neural model, to keep the pipeline
+dependency-free and fully testable offline.
 
-## Day 5 (Continued) - Module 5 Regression Tests for `GET /api/v1/workspaces`
-- Closed the outstanding gap from the previous entry: added `TestWorkspaceListing` to `tests/test_api.py`, covering the empty-list case, newest-first ordering, and the exact `WorkspaceRead` response shape (`id`/`name`/`created_at` keys only).
-- The ordering test inserts `Workspace` rows directly via the session with explicit `created_at` timestamps rather than through the API: SQLite's `func.now()` server default only has second-level resolution, so three rapid API-created rows would tie and make ordering unverifiable.
-- Achieved 100% pass rate across 3 new tests — 61 tests passing overall.
+> A regression test here earned its place immediately: without `\b` anchors,
+> "cat" counted as supported by chunks containing "category". A false
+> `entailed` is the precise failure the product exists to prevent.
 
-## Day 6 - Module 6 Document Ingestion UI
-- Implemented `uploadDocument` in `src/lib/api.ts` to handle `multipart/form-data` POST requests to `/api/v1/documents/upload`. Updated the core `request()` utility to dynamically bypass the `application/json` Content-Type header when sending files, allowing the browser to properly set the multipart boundary.
-- Built a secure `<DocumentUpload />` client component utilizing a hidden HTML file input strictly restricted to `accept=".pdf,.txt"` to enforce file types at the OS-level before upload.
-- Implemented a lightweight, custom React state-based toast notification system to elegantly surface exact backend error strings (HTTP 400/422) without relying on heavy third-party libraries.
-- Replaced the static placeholder button in `src/app/page.tsx` with the context-aware upload component that disables itself when no workspace is active.
-- Cleaned up Git tracking to exclude macOS `.DS_Store` and Python `__pycache__` artifacts.
+**Streaming.** Answers stream over SSE. The browser's native `EventSource` is
+GET-only and the query endpoint is a POST with a JSON body, so the frontend
+hand-parses frames off `fetch` + `ReadableStream`. Verified against the real
+`sse-starlette` wire format, which is CRLF-terminated — a parser splitting on
+`\n` alone produces subtly corrupted JSON.
 
-## Day 7 - Module 7 Streaming Interface & Real-Time Audit
-- Implemented `streamQuery` in `src/lib/api.ts` as an async generator that manually parses Server-Sent Events (SSE) from the `POST /api/v1/query/stream` endpoint using `response.body.getReader()`.
-- Built a robust React state machine in `src/app/page.tsx` to handle the four event types (`token`, `verification`, `done`, `error`) and drive the UI updates in real-time.
-- Wired the Chat input form to trigger the stream, rendering tokens sequentially in the main content pane.
-- Implemented the Verification Audit Log to dynamically render and color-code `ClaimVerification` objects (emerald, amber, red) as they arrive from the verifier.
-- Handled a backend contract discrepancy by gracefully omitting `supporting_chunk_index` links from the UI, ensuring resilience against missing JSON payload fields.
+---
 
-## Day 8 - Module 8 Workspace Documents View
-- Added `GET /api/v1/workspaces/{workspace_id}/documents` to `app/api/endpoints/workspaces.py`: looks up the workspace (`404` if missing), then queries `Document` outer-joined with `DocumentChunk` and grouped by document id to attach each document's `total_chunks` — a computed value, not a stored column — via a plain portable query (no Postgres-only operators), so it runs unmodified against the SQLite test fixtures.
-- Added `DocumentRead` to `app/schemas/document.py` (`id`, `filename`, `document_type`, `created_at`, `total_chunks`) as the route's strictly-typed response model.
-- Added `getWorkspaceDocuments(workspaceId)` to `src/lib/api.ts` and a new `WorkspaceDocument` type to `src/types/index.ts` — a distinct shape from the existing `Document` interface, since the endpoint's response omits `workspace_id` (already scoped by the URL) and adds `total_chunks`.
-- Built `src/components/WorkspaceDocuments.tsx`: fetches on mount and on `workspaceId` change (with a `cancelled`-flag guard against races), and renders loading / error / empty / populated states — each row showing the filename and chunk count. Nested inside `Sidebar.tsx`'s active-workspace list item, shown only when that workspace is selected and the sidebar isn't collapsed.
-- Verified the backend route directly against the in-memory SQLite test engine (empty list, a two-document case with mixed chunk counts, and the 404 case), and verified the frontend `getWorkspaceDocuments` export against a live instance of the real backend over an actual SQLite-file-backed database — not a reimplementation or mock. `tsc --noEmit`, `eslint .`, and `next build` all pass clean.
+## Phase 2 — Multi-tenancy and authentication
 
-## Day 8 (Continued) - Module 8 Regression Tests for `GET /api/v1/workspaces/{workspace_id}/documents`
-- Closed the outstanding gap from the previous entry: added `TestWorkspaceDocuments` to `tests/test_api.py`, covering the unknown-workspace 404 case, the empty-list case, newest-first ordering (via direct session inserts with explicit `created_at` timestamps, for the same SQLite `func.now()` second-resolution reason as the Module 5 ordering test), and the exact `DocumentRead` response shape together with correct `total_chunks` aggregation (a document with two chunks reports `2`; a document with none reports `0`, not `null` or an omitted key).
-- Confirmed `GET /api/v1/workspaces` (Module 5) already has full committed coverage from `TestWorkspaceListing` (added in an earlier Day 5 entry) — no additional tests were needed there.
-- Achieved 100% pass rate across 4 new tests — 65 tests passing overall.
+**Supabase Auth.** JWT verification began with the legacy HS256 shared-secret
+scheme and rejected every real token. The failure was opaque until a
+temporary debug line revealed `InvalidAlgorithmError`: the project's JWKS
+endpoint published an **ES256** key. Rewritten to verify asymmetrically via
+`PyJWKClient` against the project's JWKS, with the key set cached so a brief
+Supabase blip doesn't reject valid tokens.
 
-## Day 9 - Phase 2 Roadmap Planning
-- Finalized and documented the Phase 2 architectural blueprint in `DESIGN.md` under "### Phase 2 Execution Roadmap (Planned)": Module 9 (Enterprise Security & Multi-Tenancy — Supabase Auth, Postgres RLS, Upstash Redis rate limiting), Module 10 (Contextual Intelligence & UX — persistent `ChatSession`/`ChatMessage` history, sliding-window prompt context, LangSmith telemetry), Module 11 (Advanced Data Ingestion — layout-aware parsing, semantic boundary chunking), and Module 12 (DevOps & Cloud Orchestration — Docker, Terraform, GitHub Actions CI/CD, Vercel + AWS hybrid deployment). Planning only — no code changed this entry.
+> The lesson generalised: the generic client-facing message ("Invalid or
+> expired token") had hidden the root cause for an entire debugging cycle.
+> Specific exceptions are now logged server-side while the client still
+> receives the generic message.
 
-## Day 9 (Continued) - Module 9 Auth & RLS
-- **Frontend:** Installed `@supabase/supabase-js` and `@supabase/ssr`. Built `src/app/login/page.tsx` (dark-themed login/signup form) and `src/lib/supabase/client.ts` (browser client factory). Split the root layout into a `(dashboard)` route group so `/login` renders without the `Sidebar`/`WorkspaceProvider` shell.
-- Added the dashboard route guard as `src/proxy.ts`, not `src/middleware.ts` as originally specified: this pinned Next.js 16 renamed the `middleware` file convention to `proxy` (the old name still works but is deprecated — `frontend/AGENTS.md` explicitly says to check this version's own docs before writing framework code, which is how this was caught). Uses `@supabase/ssr`'s `createServerClient` + `supabase.auth.getUser()` for a server-revalidated auth check.
-- `src/lib/api.ts` gained `getAuthHeaders()`, called from both `request()` and `streamQuery()`, injecting `Authorization: Bearer <access_token>` from the active Supabase session into every backend call. Added a "Sign Out" button to `Sidebar.tsx`.
-- **Backend:** Added `pyjwt` to `requirements.txt`. Added `supabase_jwt_secret` to `config.py` (still needs a real value in `backend/.env` — get it from the Supabase dashboard). Added `user_id` (UUID, `NOT NULL`) to `app/models/workspace.py`.
-- Added `get_current_user` (verifies the `Authorization: Bearer <jwt>` header via `PyJWT` against `SUPABASE_JWT_SECRET`, `HS256`/`audience="authenticated"`, returns the `sub` claim) and `get_authenticated_db` (sets the Postgres session variable `app.current_user_id` via `set_config(..., true)` — a bind-parameterized call, not a literal `SET LOCAL ...` as originally specified, since asyncpg's extended query protocol can't bind parameters into a bare `SET` statement) to `app/api/deps.py`.
-- `app/db/init_db.py` now enables RLS on `workspaces` and creates a `workspace_isolation` policy (Postgres only — dialect-gated exactly like `PortableVector`, so the SQLite test engine is unaffected). Used the actual table name `workspaces`, not the singular `workspace` from the original spec — the literal form would have failed at bootstrap against a real Postgres instance.
-- Wired `get_authenticated_db` into every endpoint that touches `workspaces` — `list_workspaces`, `create_workspace` (now stamps `user_id`), `list_workspace_documents`, `upload_documents`, and `stream_query` — not just workspace creation as originally scoped: all five call `session.get(Workspace, ...)` or `SELECT ... FROM workspaces`, so leaving any of them on plain `get_db` would have broken them outright under RLS (or left an unauthenticated hole beside a "secured" create route).
-- Updated `tests/test_api.py` and `tests/test_database.py` for the new `NOT NULL user_id` column and the new auth dependency: added a global `get_current_user` override in the `client` fixture (one line, alongside the existing `get_hybrid_retriever` stub pattern) and `user_id=...` to every direct `Workspace(...)` instantiation that bypasses the API. All 65 existing tests still pass unchanged in behavior.
-- Verified live: confirmed the real Supabase project (URL/publishable key already in `frontend/.env.local`) is reachable and correctly rejects a bogus login with a genuine Supabase error response (no test user created); confirmed `next build` compiles both routes and the proxy; confirmed the proxy actually redirects `/` → `/login` for an unauthenticated request via a running dev server. Unit-verified the JWT decode/verify logic (valid token, wrong secret, wrong audience) with a synthetic secret, since the real `SUPABASE_JWT_SECRET` isn't available yet.
-- **Known gaps (see DESIGN.md's Module 9 section for the full list):** `SUPABASE_JWT_SECRET` not yet set in `backend/.env`; no RLS on `documents`/`document_chunks` (only `workspaces`); `Workspace.name` uniqueness is still global, not per-user; no committed regression tests for `get_current_user`, `get_authenticated_db`, or the RLS policy itself.
+**Row-Level Security — and the bug that looked like success.** Policies were
+written on every tenant table. They were syntactically correct, visible in
+`pg_policies`, and **enforcing nothing**, because the application connected as
+`postgres` — and PostgreSQL exempts `SUPERUSER` and `BYPASSRLS` roles from
+every policy unconditionally.
 
-## Day 9 (Continued) - Module 9 NameError Fix & Security Test Coverage
-- **`NameError: name 'get_db' is not defined`:** reproduced the report, then confirmed the current `workspaces.py`/`query.py`/`documents.py` all import cleanly and the live `uvicorn --reload` process already serves `/health` and correctly 401s `/api/v1/workspaces` without a token. Root cause: mid-refactor, each of those files briefly had its `from app.db.session import get_db` import removed by one edit before a *separate* edit swapped the remaining `Depends(get_db)` call sites to `Depends(get_authenticated_db)` — `--reload` caught that in-between state and crashed. The crash was real but transient; the code has been consistent (and importable) since the previous entry finished. No source fix was needed for the import itself.
-- **A real bug the exercise did surface:** `list_workspaces`, `list_workspace_documents`, `upload_documents`, and `stream_query` only ever checked that a workspace *existed* (`if workspace is None: raise 404`), never that the *caller* owned it. Combined with Postgres RLS being a no-op on the SQLite test database (and skippable in production by any superuser/`BYPASSRLS` role), this meant cross-user isolation had **zero enforcement** in the test environment — any authenticated user could list, view, or upload to any other user's workspace. Added `ensure_workspace_owner()` to `app/api/deps.py` (compares `workspace.user_id` against the caller's id, same 404 either way so a mismatch can't be distinguished from nonexistence) and wired it into all four endpoints, plus scoped `list_workspaces`'s own query to `WHERE user_id = :caller`. This is the fix that actually makes RLS-style isolation testable and guaranteed, independent of dialect or DB role — Postgres RLS remains as a second, redundant layer.
-- Added `backend/tests/test_security.py` (13 new tests): `TestJWTValidation` (7 tests — missing header, malformed header, invalid signature, expired token, wrong audience, missing `sub` claim, and a valid-token control case — all against a `real_auth_client` fixture that does *not* stub `get_current_user`, so the real `PyJWT` verification runs, with `SUPABASE_JWT_SECRET` monkeypatched for the test only); `TestCrossUserIsolation` (5 tests — User B gets an empty list / `404` / `404` / `404` trying to list, view-documents, upload-to, and query-stream User A's workspace respectively, plus a control case confirming User A can still access their own); `TestOwnershipStamping` (1 test — reads the `Workspace` row back from the DB directly and asserts `user_id` matches the creator).
-- Ran `pytest`: **78 tests passing** (65 previous + 13 new), zero failures, zero regressions.
+It surfaced from a *behavioural* test: connect as a second user, confirm they
+can read the first user's rows. A configuration audit would have shown green.
 
-## Day 9 (Continued) - Real 401s: `InvalidAlgorithmError` Root Cause & JWKS Fix
-- Real Supabase-issued tokens were getting rejected with `401`. Added a temporary debug print in `get_current_user`'s except clause and re-tested: the backend log showed `JWT ERROR: InvalidAlgorithmError('The specified alg value is not allowed')` — not a signature, audience, or expiry failure.
-- **This was not a missing/mistyped `algorithms` parameter** (the initial theory): `deps.py` already correctly passed `algorithms=["HS256"]`, and the committed test suite already proved HS256 tokens decode successfully against that exact code. Confirmed by reading this Supabase project's own JWKS endpoint directly (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`, a public, unauthenticated, read-only request) — it publishes a single **ES256** (asymmetric elliptic-curve) signing key. This project uses Supabase's newer JWT-signing-keys scheme, not the legacy HS256-shared-secret scheme `get_current_user` was built against; no `SUPABASE_JWT_SECRET` value could ever have made HS256 verification succeed here.
-- **Real fix:** replaced the HS256/shared-secret verification in `app/api/deps.py::get_current_user` with JWKS-based ES256 verification via `jwt.PyJWKClient` (cached per URL through a new `_get_jwk_client()`, which itself caches the fetched key set for 5 minutes) — resolves the correct signing key per token, then verifies with `algorithms=["ES256"]`. Removed the temporary debug print/broad `except` block, restored to permanent, specific exception handling (`PyJWKClientError` for an unresolvable key, `PyJWTError` for a failed decode).
-- `config.py`: replaced `supabase_jwt_secret` with `supabase_url` (not a secret — just the project URL needed to build the JWKS endpoint). `requirements.txt`: `pyjwt` → `pyjwt[crypto]` (ES256 needs the `cryptography` package, previously only a transitive dependency).
-- `tests/test_security.py`: replaced the shared-HS256-secret token fixtures with a throwaway EC (P-256) key pair and a `_StubJWKClient` that hands back its public half — `_get_jwk_client` is monkeypatched so no real network call to Supabase happens in tests. All existing JWT-validation test cases (missing header, malformed header, invalid signature, expired, wrong audience, missing `sub`, valid-token control) carried over unchanged in intent, just re-signed with ES256.
-- Ran `pytest`: **78 tests passing**, no regressions. Verified the live `uvicorn --reload` process picked up the change cleanly (`/health` still 200, missing-auth-header still 401, and a request with a token but no `SUPABASE_URL` configured now correctly 500s with `"SUPABASE_URL is not configured"` instead of the old secret-based message).
-- **Still outstanding:** `SUPABASE_URL` needs to be added to `backend/.env` for real tokens to verify in this environment (it's the project's own URL, not a secret). Did not test against a real signed-up Supabase user in this pass — that would create a permanent row in the project's real `auth.users` table, which wasn't asked for and isn't reversible from here.
+Three things came out of the fix:
 
-## Day 9 (Continued) - Live DB Schema Fix: `workspaces.user_id`
-- `SUPABASE_URL` has since been added to `backend/.env`, and the backend is now running against the real local Docker Postgres (`sourceguard-db`, `pgvector/pgvector:pg16`) rather than SQLite — that database's `workspaces` table pre-dates Module 9, so it didn't have the `user_id` column the ORM model now declares, causing `asyncpg.exceptions.UndefinedColumnError` on every workspace query.
-- Inspected the live table first (read-only) before changing anything: 4 real workspaces and 8 documents already existed. Added `user_id` as a **nullable** column via a temporary `migrate_db.py` script (run once, then deleted) rather than `TRUNCATE`-ing the table: the existing rows have no natural owner, and destroying real dev data wasn't necessary just to add a column. Those 4 rows now have `user_id = NULL` — invisible under RLS once it's enabled, but not deleted; nothing else about `init_db.py`'s RLS/policy setup was touched in this pass (RLS is still not enabled on this live table).
-- Verified directly against Postgres: the exact query shapes that crashed (`SELECT ... FROM workspaces WHERE user_id = ...`, `INSERT INTO workspaces (..., user_id) VALUES (...)`) now succeed; all 4 pre-existing rows are still present and unmodified. `pytest` still 78/78 (unaffected — the suite runs on SQLite, not this database).
-- **Found, but did not fix (out of scope for this fix):** verifying an HTTP request with a malformed (non-3-segment) bearer token now hits real Postgres/JWKS config and throws an unhandled `jwt.exceptions.DecodeError` inside `PyJWKClient.get_signing_key_from_jwt()` - `get_current_user`'s `except jwt.PyJWKClientError` doesn't catch it, so it surfaces as a raw `500` instead of the intended `401`. Separate bug from the schema issue; flagged for a follow-up fix.
+1. `init_db` now provisions a restricted `sourceguard_app` role —
+   `NOSUPERUSER NOBYPASSRLS`, CRUD only, never DDL, deliberately not the
+   table owner.
+2. A widely-held misconception was disproved against a live database:
+   `FORCE ROW LEVEL SECURITY` does **not** constrain a superuser. It extends
+   policies to the table owner. A code comment claiming otherwise was
+   corrected.
+3. Enforcing RLS exposed a second, latent bug. The tenant variable was
+   transaction-scoped, and several endpoints commit mid-request, so every
+   query after the first ran with no tenant context. Invisible while the
+   policies were inert, because the superuser bypassed them anyway. Moved to
+   session scope, with a teardown reset so a pooled connection cannot carry
+   one user's context into another's request.
 
-## Day 9 (Continued) - Malformed-Token 500 Fixed
-- Patched the bug flagged above: `get_signing_key_from_jwt()` parses the token's header *before* any key lookup, so a malformed token (too few `.`-separated segments) raises `jwt.exceptions.DecodeError`, not `jwt.PyJWKClientError` - and the `except` around that call only caught the latter. `DecodeError` is a `PyJWTError` subclass (confirmed: so is `PyJWKClientError`), so widened that `except` to `jwt.PyJWTError`, covering both failure modes with the existing `401 "Unable to resolve token signing key"` response instead of an unhandled `500`.
-- Added `test_malformed_token_string_returns_401_not_500` to `TestJWTValidation` in `tests/test_security.py` - sends `Authorization: Bearer not.a.real.token` to a protected route and asserts `401`.
-- Verified directly (reproduced the raw `DecodeError` traceback before the fix, confirmed a clean `HTTPException(401)` after) and against the live server (`Bearer not.a.real.token` now returns `401` instead of `500`). Ran `pytest`: **79 tests passing** (78 previous + 1 new), no regressions.
+**Ownership checks.** A user-reported crash turned out to be a stale
+`--reload` artifact — but investigating it surfaced a real defect: several
+endpoints checked that a workspace *existed* and never that it belonged to
+the caller. `ensure_workspace_owner` was added, returning an identical 404
+for "absent" and "not yours" so IDs cannot be enumerated.
 
-## Day 9 (Continued) - Redis Rate Limiting
-- Finished Module 9: added a sliding-window-log rate limiter to `app/api/deps.py`, backed by a Redis sorted set. `_SLIDING_WINDOW_SCRIPT` runs `ZREMRANGEBYSCORE` (drop entries older than the window) + `ZCARD` (count) + the limit check + `ZADD` as a single atomic `EVAL`, so concurrent requests from the same user can't race between checking and recording. Verified the script directly against the real local Redis container first (5 allowed, then blocked, exactly as expected) before wiring it in.
-- `rate_limit_user` (10 requests / 60s) is keyed strictly by authenticated `user_id`, applied to `POST /api/v1/query/stream` via route-level `dependencies=[Depends(rate_limit_user)]` - the most critical endpoint per the task, since it's the LLM-backed one and the primary Denial-of-Wallet exposure. Also added the optional `rate_limit_upload` (20/60s, looser - storage/embedding-cost protection) to `POST /api/v1/documents/upload`. Both raise `HTTPException(429)`.
-- Added `redis` to `requirements.txt` (the `redis.asyncio` client - not previously a dependency, only `redis_url` existed as unused config).
-- Hit a real bug while wiring this into the test suite: caching one Redis client per URL via `@lru_cache` (the same pattern already used for `_get_jwk_client`, which works fine there since `PyJWKClient` is sync/HTTP-only) breaks for the *async* Redis client - its connection pool binds to the event loop it was created in, and pytest-asyncio gives each test function a fresh loop, so a client cached from an earlier test becomes a dead reference (`RuntimeError: Event loop is closed`) in a later one. Fixed by making `get_redis_client` overridable and adding an in-memory `_FakeRedis` (reimplementing the Lua script's exact semantics) to both `tests/test_api.py`'s `client` fixture and `tests/test_security.py`'s `real_auth_client`/`multi_user_client` fixtures - not just to avoid a real Redis dependency in CI, but because the real client was actively broken across tests without this.
-- Added `TestQueryRateLimiting` to `tests/test_security.py` (3 tests): requests under the limit pass through to normal processing (asserted via `404` against a nonexistent workspace, since the rate limiter runs before workspace lookup and doesn't care whether it's real - only whether budget remains), the request that trips the threshold returns `429`, and one user's exhausted budget doesn't affect another user's own limit.
-- Ran `pytest`: **82 tests passing** (79 previous + 3 new), no regressions. Also verified the *real* (non-fake) `_check_rate_limit`/`get_redis_client` functions directly against the real local Redis container - ten requests allowed, then denied - and confirmed no leftover `ratelimit:*` keys were left behind afterward.
-- `DESIGN.md`: moved "Redis Rate Limiting" from Module 9's "Planned" bullet into its "As-Built" section; also corrected a now-stale claim there that `SUPABASE_URL` still needed to be added to `backend/.env` (it's been added since the last entry).
+---
 
-## Day 10 - Module 9 Fail-Open (verification + fix) & Module 10 Conversation Memory
+## Phase 3 — Production constraints
 
-### Verification first: the Redis fail-open fallback was NOT implemented
-- Asked to verify the fail-open fallback and its tests were "fully implemented and documented" before starting Module 10. They were not. Grepping `app/api/deps.py` found no Redis exception handling at all (only JWT `except` clauses), no test referenced it, and no doc claimed it existed - it was recorded in the previous entry as a *known gap*, not as done. Confirmed empirically by pointing `_check_rate_limit` at a dead Redis port: it raised `ConnectionError` straight through, which would have surfaced as an unhandled `500` on every rate-limited route during a Redis outage.
-- Implemented it: `_check_rate_limit` now catches `RedisError` and returns `True` (allow), logging at WARNING. The tradeoff is deliberate and documented in the docstring - a Redis outage would otherwise take the whole API down, but DoW protection *is* disabled while Redis is unavailable.
-- Added `test_rate_limiter_fails_open_when_redis_is_unavailable`. Note the subtlety it pins down: the fake client must raise `redis.exceptions.ConnectionError`, **not** Python's builtin `ConnectionError` - the builtin is an `OSError` and would not be caught by `except RedisError`. The builtin was used initially and corrected during review.
+**Containerisation and CI.** Multi-stage Docker builds, non-root users, and a
+GitHub Actions pipeline running pytest, typecheck, lint, and build. No service
+containers: the suite runs on SQLite with Redis faked and AI providers mocked,
+so CI needs no Postgres, no Redis, and no network egress.
 
-### Module 10 - schema & migration
-- Added `app/models/chat.py`: `ChatSession` (`id`, `workspace_id` FK CASCADE, `user_id`, `created_at`) and `ChatMessage` (`id`, `session_id` FK CASCADE, `role`, `content`, `created_at`), registered in `app/models/__init__.py`.
-- `role` is `Enum(MessageRole, native_enum=False)` → portable `VARCHAR(16)` instead of a Postgres native `ENUM`, so migration and `create_all` don't each have to manage a `CREATE TYPE`. Verified the DDL compiles identically under both the Postgres and SQLite dialects before running anything.
-- `ChatMessage.created_at` uses a Python-side microsecond default rather than `server_default=func.now()` (which every other model here uses): conversation ordering depends on this column and SQLite's `now()` only resolves to the second, so sibling messages in one request would tie - the same limitation that previously forced explicit timestamps in the ordering tests.
-- Wrote, ran, verified, and deleted `migrate_module_10.py`. Confirmed against the live Postgres: both tables exist with the expected columns, `relrowsecurity = true` on both, and both policies present. `chat_messages` has no `user_id` column (per spec), so its policy reaches the owner through a subquery on `chat_sessions` - the standard RLS pattern for a child table.
+> Two Next.js traps cost real time. `NEXT_PUBLIC_*` are inlined at **build**
+> time, so passing them at `docker run` bakes in `undefined` — the app starts
+> and cannot reach the API. And standalone output omits `public/` and
+> `.next/static/`, so the container boots cleanly and 404s every stylesheet.
 
-### Module 10 - conversation memory
-- `QueryRequest` gained an optional `session_id`. `app/services/conversation.py` holds the session/history logic (kept out of the endpoint per the project's "no monolithic files" rule, and so it's unit-testable without SSE).
-- Session resolution happens in the **endpoint**, before `EventSourceResponse` is returned - once streaming starts the status line is committed, so a bad `session_id` could only be reported as an in-band SSE `error` rather than a real `404`. Unknown / other-user / **other-workspace** ids all 404 (a session id valid across workspaces would let one workspace's conversation be spliced into another's retrieval context).
-- Sliding window: newest 10 via `ORDER BY created_at DESC LIMIT 10` (DB does the windowing), reversed to chronological. History is loaded *before* the current question is saved, so the current turn isn't replayed as prior context. `stream_answer` splices prior turns in as their own role-attributed messages ahead of the final prompt rather than flattening them into the prompt string.
-- New `session` SSE event carries `session_id` up front (a client starting a fresh conversation needs the id even if the stream later errors); `session_id` also added to `done`. Both are backward-compatible with the existing frontend parser, which ignores unknown event names.
+**The embedding provider migration.** Switching to Gemini's
+OpenAI-compatibility layer took several iterations, each one a genuine
+constraint discovered by hitting it:
 
-### Module 10 - LangSmith telemetry
-- ⚠️ The brief's premise didn't hold: `LANGCHAIN_TRACING_V2=true` auto-instruments LangChain/LangGraph *runnables*, and this backend has none. Generation is raw `httpx` → Groq, retrieval is hand-written SQL, verification is a dependency-free heuristic; the only `langchain` import in the entire backend is `RecursiveCharacterTextSplitter`, a pure string splitter that never calls a model. Setting that env var alone would have emitted **zero** traces.
-- So tracing is explicit: `app/services/telemetry.py` exposes `traced()`, applied to `_stream_query_events`, `_retrieve_context`, and `_verify_answer`. The standard env vars remain the on/off switch (both `LANGCHAIN_TRACING_V2` and the current `LANGSMITH_TRACING` are read), plus an API-key requirement - a key-less "enabled" would fire failing network calls on the request path. Verified all three states: off → passthrough, on-without-key → passthrough, on-with-key → genuinely wrapped by `langsmith`. Added `langsmith` to `requirements.txt`.
+- The `dimensions` field is **rejected with a 400**, so Matryoshka truncation
+  is unavailable and the column must match the native width.
+- `input` must be a **single string** — a list is also a 400 — so batching
+  moved client-side: one request per chunk, issued concurrently.
+- Settling the true output width took two corrections in both directions
+  before landing on 3072.
 
-### Testing & a significant finding
-- Added `TestConversationMemory` (8 tests) to `tests/test_api.py`. One is deliberately a spy on `GenerationService.stream_answer`: the mock token stream ignores `history`, so every other test would still pass even if history were never actually wired into generation.
-- One test failed on first run and the **test** was wrong, not the code - the window assertion failed to account for the seeding turn's two `datetime.now()` messages being newer than the 2024 backfill and legitimately occupy two of the ten slots. Rewrote it to build the session directly so the window boundary is isolated.
-- `pytest`: **91 passing** (83 previous + 8 new), no regressions. Also verified the whole flow end-to-end against the **real Postgres** (tests run on SQLite): session created, reused across turns, all four messages persisted in the right order with the right roles, cascade cleanup confirmed.
-- **⚠️ Significant finding - RLS is inert in this deployment.** That same end-to-end run showed a *different* user could still read another user's `chat_sessions` row. Root cause: the app connects as the `postgres` role, which has `rolsuper` **and** `rolbypassrls` - so **every RLS policy in this project, Module 9's `workspaces` policy included, is bypassed at runtime**. The policies are correctly defined; they simply don't apply to this connection role. All real tenant isolation today comes from the application layer (`ensure_workspace_owner`, `list_workspaces`' `user_id` filter, `get_or_create_session`'s ownership check), which is why those are written as primary enforcement. Fixing this means connecting as a non-superuser role without `BYPASSRLS` - an infrastructure change, not a code one, so it has not been made. Documented prominently in `DESIGN.md`.
+Each constraint is now recorded as a `NOTE` in the request builder and backed
+by a regression test, because all three are natural things to "fix" back.
 
-## Day 10 (Continued) - Module 10 Frontend: Multi-Turn Chat UI
-- Backend Module 10 shipped the session plumbing but the UI was still single-query and never sent `session_id`, so every turn silently started a fresh conversation. Wired the frontend up to it.
-- **`src/lib/api.ts`:** `streamQuery` gained a third `sessionId` parameter (defaulting to `null`) and now sends `session_id` in the body; `QueryStreamEvent` gained a `session` variant plus `session_id` on `done`. `done.session_id` is parsed defensively - absent becomes `null` rather than rejecting the frame, since the `session` event is the primary carrier and a `done` without it is still a usable answer.
-- **New `src/components/ChatPanel.tsx`:** replaces the single `submittedQuery`/`answer` pair with `messages: ChatTurn[]`, each turn carrying its own `claims`/`overallScore`/`isFullySupported`/`error`. Per-turn ownership matters for scrollback correctness - with one global claim list, every earlier answer in the thread would retroactively display the newest answer's verification results. Turns are updated by a `crypto.randomUUID()` id rather than array position.
-- `sessionId` is captured from the `session` event (emitted before any token, so a brand-new conversation is continuable from the very next turn even if the stream later errors), with `done.session_id` as a fallback.
-- **Workspace-switch reset via the `key` prop rather than a reset `useEffect`.** `page.tsx` mounts `<ChatPanel key={activeWorkspace?.id ?? "no-workspace"} />`; switching workspaces remounts and clears `messages` + `sessionId` for free. Chose this for two reasons, not style: resetting state on a prop change via `setState` inside `useEffect` is exactly what this repo's lint config rejects (`react-hooks/set-state-in-effect` - the same rule that forced the async-function restructure in `WorkspaceDocuments` back in Module 8), and keying is React's documented alternative. It's also right on the merits: a session is workspace-scoped server-side, so carrying a thread or session id across a switch would be wrong however the reset were written.
-- Auto-scroll depends on both `messages.length` and the latest turn's content, so the view follows a long answer as tokens land instead of jumping once per turn.
-- **`FormEvent` → `SubmitEvent`:** `@types/react` marks `FormEvent` `@deprecated` ("doesn't actually exist … you probably meant `SubmitEvent`"), and `frontend/AGENTS.md` says to heed deprecation notices, so the new component uses `SubmitEvent<HTMLFormElement>`. Checked the type definition to confirm `SubmitEvent` exists in this pinned version before switching. The old code used `FormEvent` too - a hint-level diagnostic, not an error, so nothing was broken.
-- Also corrected a long-stale line in `DESIGN.md`'s "Frontend Architecture (As-Built)" that still described `page.tsx` as a placeholder with "no streaming wiring exists yet" (untrue since Module 7) and used its pre-Module-9 path.
-- **Verified:** `tsc --noEmit`, `eslint .`, and `next build` all clean; backend still 91/91. Then exercised the *real* `streamQuery` export against the *real* backend and *real* Postgres (auth/Redis stubbed only): turn 1 with `session_id: null` created a session whose id matched on both the `session` and `done` events, turn 2 reused it, and the DB showed one session with four correctly-ordered alternating messages - the second answer responding contextually to the follow-up, which is direct evidence history reached the live model rather than just being persisted. Fixture data cleaned up afterward.
-- **Not verified:** interactive browser click-through (typing, watching the thread auto-scroll, the workspace-switch reset visually) - no browser-automation tool is available in this environment, so the visual layer rests on the build plus the contract test above.
+**Rate limiting the outbound path.** One request per chunk against a 15/min
+quota produced `429`s immediately. The instinctive fix — a semaphore plus a
+sleep — does not bound a rate: two workers each sleeping two seconds still
+issue ~60 requests/minute, because they sleep in parallel.
 
-## Day 11 - Module 11: Advanced Data Ingestion (Layout-Aware Parsing + Semantic Boundaries)
-- **Library choice: PyMuPDF, not `unstructured`.** The brief offered either. Probed the installed PyMuPDF (1.28) first and confirmed empirically — on a generated PDF with a title, heading, paragraph, list and a ruled table — that `find_tables()` extracts exact cell data and renders clean Markdown, and that `get_text("dict")` exposes per-span font size and bold flags. That covers everything this module needs with **zero new Python packages and zero system dependencies**. `unstructured`'s high-fidelity PDF path pulls `poppler`/`tesseract` and downloads ONNX/detectron layout weights, which would break two constraints DESIGN.md has stated since Module 3: "No local model downloads" and a network-free offline dev/test path. Verified the capability before committing rather than assuming it from the version number.
-- **`app/services/layout_parser.py`:** emits ordered `LayoutElement`s (`HEADING`/`PARAGRAPH`/`LIST_ITEM`/`TABLE`). Heading detection is *relative* to the document's own body size (character-weighted median of all span sizes, so a few large title spans can't skew the baseline and turn every paragraph into a heading), plus short-bold and Markdown `#` heuristics. Tables render to Markdown so row/column relationships survive into the embedding.
-- **Table-region text suppression** turned out to be essential, not incidental: cell text also lives in the page's ordinary text layer, so without bbox-overlap filtering every cell was emitted a *second* time as loose prose — duplicating content and destroying the very structure the Markdown table preserves. Pinned with a regression test.
-- **`app/services/semantic_chunker.py`:** three rules — tables atomic; headings bind to the content they introduce (and are re-prepended to continuation chunks so an isolated chunk still names its section); size is a ceiling, with splits landing on element boundaries rather than mid-sentence.
-- **A newly written test caught a real defect in the implementation.** The oversized-element fallback split *any* single element over the ceiling — including tables, shredding a large one into 72 fragments. That defeats the module's headline requirement: splitting a table drops the header row and leaves every later fragment's cells uninterpretable. Fixed by exempting atomic elements; an oversized table is now emitted whole. Documented the deliberate tradeoff (a giant table may be truncated at embed time, which degrades one chunk, versus splitting which corrupts the column semantics of all of them).
-- **Two other issues found during implementation:** consecutive list items sharing one PyMuPDF block were welded together (`"...growth- EMEA improved..."`) because a block's visual lines were joined with `""` instead of `"\n"`; and a document title followed immediately by a section heading emitted the title as a standalone few-word chunk, so heading-only groups now fold forward into the next group. Both have regression tests.
-- **Offset traceability preserved.** Module 1's guarantee survives the move from character slicing to element assembly: the chunker reconstructs the canonical text, records each element's span, and derives offsets from element positions — so `source[start:end] == content` holds exactly for contiguous runs (asserted by a test). The single exception, a continuation chunk with a re-prepended heading, is explicitly flagged via `heading_prefixed`.
-- **Plain text** gets boundary-aware treatment too (blank lines, `#` headings, list markers), so `.txt` ingestion is no longer character-sliced either.
-- **`RecursiveChunker` retained**, still under its original 5 tests, now serving as the fallback for a single oversized non-atomic element. Annotated as superseded-for-ingestion in DESIGN.md rather than deleted.
-- **Dependencies:** none added. Annotated `pymupdf`'s expanded role in `requirements.txt`, and wrote `README.md` (previously empty, 0 bytes) documenting setup plus an explicit "no poppler/tesseract required, and therefore no fallback path needed" section — the primary rationale for the strategy choice. One inaccuracy was corrected during authoring: a reference to a non-existent `backend/.env.example` was replaced with the variable table, rather than leaving a broken setup step.
-- **Tests:** new `tests/test_ingestion.py` (23 tests). Full suite **114 passing** (91 previous + 23), no regressions in the existing document-processing or security suites.
+What bounds a rate is the spacing between request *starts*. A pacer
+serialises reservations behind a lock at `60/15 = 4` seconds, with a
+semaphore capping in-flight connections at 2 and exponential backoff
+(proportional jitter, `Retry-After` honoured) absorbing the rest. Only 429 is
+retried.
 
-## Day 12 - Module 12: DevOps & Cloud Orchestration (Containerization + CI)
-- **`backend/Dockerfile`** on `python:3.11-slim`: `requirements.txt` installed before the code copy so the dependency layer is keyed only on the lockfile; non-root `appuser` created after the pip layer so user setup can't invalidate it; `HEALTHCHECK` on the existing `/health` route via `urllib` rather than `curl`/`wget` (neither ships in `-slim`, and adding one just for a healthcheck would grow the image for nothing). Plus `backend/.dockerignore` excluding `venv/`, `__pycache__/`, `.env*`, `.pytest_cache/`, and test artifacts.
-- **`frontend/Dockerfile`**, three stages (`deps` → `builder` → `runner`) on `node:22-alpine` with `libc6-compat`, non-root. Set `output: "standalone"` in `next.config.ts` first.
-- **Read this Next.js version's own docs before writing the Dockerfile** (per `frontend/AGENTS.md`) and it paid off: standalone output deliberately omits `public/` and `.next/static/` on the assumption a CDN serves them. Without explicitly copying both, the container boots fine and then 404s every stylesheet, chunk, and font — a failure that looks like the app working until you load a page. Both are copied in and verified serving 200.
-- **`NEXT_PUBLIC_*` had to be build ARGs, not runtime env.** Next inlines them into the client bundle at build time, so passing them only to `docker run` would silently ship a bundle with `undefined` baked in — a frontend that builds, starts, and simply can't reach the API. Wired as ARGs and verified by grepping the built image for the baked API and Supabase URLs.
-- **`docker-compose.yml`: `backend` + `frontend` only, no Postgres/Redis — a deliberate call.** This machine already runs `sourceguard-db` and a Redis container on 5432/6379; declaring them again in compose would collide on those ports and risk a second, empty database silently shadowing the real one with all its data. The services reach the existing ones over `host.docker.internal` (with an `extra_hosts: host-gateway` mapping so it also resolves on Linux, not just Docker Desktop), and `DATABASE_URL`/`REDIS_URL` are overridden because `localhost` inside a container is the container itself.
-- Also got `NEXT_PUBLIC_API_URL` right: it defaults to `http://localhost:8000/api/v1`, **not** `http://backend:8000`. That URL is fetched by the user's *browser*, which runs on the host and can't resolve compose service names — the classic compose mistake.
-- **`.github/workflows/ci.yml`:** push + PR against `main`, with a `concurrency` group cancelling superseded runs. Backend job (Python 3.11, pip cache, `pytest`) and a frontend job (Node 22, npm cache, `tsc` + `eslint` + `next build`). No `services:` block needed — the suite runs on in-memory SQLite with Redis faked and the deterministic offline AI mocks, so CI needs no Postgres, no Redis, and no network egress.
-- **Verified by building and running, not just checking syntax.** Docker was available, so: both images built; the backend image ran the full suite — **114/114 passing on Python 3.11**, which is a real result rather than a formality, since local dev runs 3.14 and this is the first time the code has been executed on the version CI and production will use. The frontend container was started and confirmed to 307-redirect `/` → `/login`, serve `/login` at 200, and serve both `.next/static` and `public/` assets. Queried the real Postgres from inside a container to prove the `host.docker.internal` override actually works. `docker compose config` validates. Test images cleaned up afterward.
-- **Scope note:** the brief's Module 12 also lists Terraform IaC and Vercel/AWS hybrid deployment. Those are *not* implemented — this pass covers containerization and CI only. DESIGN.md keeps them under "Planned" rather than marking Module 12 wholly complete.
-- **Surfaced, not fixed (addressed in the follow-up below):** the 3.11 container run emitted `DeprecationWarning: The 'fitz' API is deprecated ... Use 'import pymupdf' instead.` Both `document_parser.py` and `layout_parser.py` import `fitz`. Harmless today, will break on a future PyMuPDF major. Flagged rather than silently expanding a DevOps module into a refactor.
+> The first backoff used a flat `random.uniform(0, 1)` jitter term, which
+> didn't scale to zero — the test suite took 10 s instead of 5. Making jitter
+> proportional to the delay fixed both the speed and the algorithm.
 
-## Day 12 (Continued) - PyMuPDF Import Modernization
-- Closed the deprecation flagged above: `import fitz` → `import pymupdf`, with `fitz.open`/`Document`/`Rect`/`Page` references updated accordingly.
-- **Four files, not two.** The brief named the two service modules, but `tests/test_document_processing.py` and `tests/test_ingestion.py` also `import fitz` to build fixture PDFs — and the warning fires on the import itself, so leaving those would have left the warning in CI output regardless of the service fix. Renamed all four.
-- Confirmed `pymupdf.open`, `.Document`, `.Rect`, and `.Page` are the *same object instances* as their `fitz` counterparts before renaming, so this is a pure alias change with no behavioral risk — worth checking rather than assuming, since a blind find-and-replace on a public API is exactly where a subtle signature difference would hide.
-- **Verified in the CI-equivalent Python 3.11 container**, not just locally — the warning only ever appeared there, so a local-only check would have proven nothing. `python -W error::DeprecationWarning -c "import app.main"` now passes (it would raise on the fitz warning), and the suite runs **114/114**.
-- **One warning remains, stated precisely:** the container run still reports one warning, from `starlette/testclient.py` (`anyio.abc.BlockingPortal` alias deprecated). That is third-party library code, not this project's. No `filterwarnings` ignore was added to make the count read zero: that would hide the warning rather than fix it, and would also mask any *future* warning from the same module. Fixable properly by upgrading Starlette/httpx when convenient.
+**Asynchronous ingestion.** Correct pacing made ingestion slow by
+construction: a 50-chunk PDF needs over three minutes of wall clock, well
+beyond any HTTP request lifetime. Upload became `202 Accepted` with a
+per-document status URL, the work moved to a FastAPI `BackgroundTask`, and a
+frontend polling hook drives the UI to completion.
 
-## Day 13 - Module 12 (second half): Terraform IaC & Deployment
-- **`infrastructure/`** with `main.tf`, `variables.tf`, `outputs.tf`, and a tracked `terraform.tfvars.example`: VPC + two public subnets across distinct AZs, IGW/route table, two security groups, ALB + HTTP listener + target group, CloudWatch log group, ECS cluster, Fargate task definition, and the ECS service. A `validation` block enforces the ≥2-subnet rule an ALB requires, so a bad CIDR list fails at plan time rather than mid-apply.
-- **Chose ECS + Fargate over the roadmap's older "AWS EC2/RDS" line.** The brief for this pass asked explicitly for ECS/Fargate, and RDS is redundant here: Supabase already provides Postgres *and* the Auth/JWKS issuer that Module 9's token verification depends on. Provisioning RDS too would mean two Postgres instances and a second identity story.
-- **Deviated from "Security Groups (allowing ingress on port 8000)" on purpose.** Taken literally — 8000 open to `0.0.0.0/0` — callers could hit tasks directly and bypass the load balancer, making the ALB decorative. Implemented as: ALB SG takes 80/443 from the internet, task SG accepts 8000 *only* from the ALB's SG. Same requirement, without the hole.
-- Tasks run in public subnets with `assign_public_ip = true` — a documented cost tradeoff. Private subnets would need a NAT gateway (~$32/mo) for ECR pulls and Supabase/Upstash/Groq egress; the security group provides the isolation instead. Also noted in-file that without the public IP the task can't pull its image and fails to start, which is a confusing failure to debug cold.
-- **Two IAM roles, deliberately separate.** Execution role (ECS agent: image pull + logs) carries `AmazonECSTaskExecutionRolePolicy` **plus** an inline policy for `ssm:GetParameters`/`secretsmanager:GetSecretValue` scoped to only the ARNs passed in — the managed policy does *not* grant secret reads, so the `secrets` block would fail at task start without it. The task role (the application) is intentionally empty: the backend needs no AWS API access at all.
-- Secrets are referenced by ARN and resolved by the agent at task start, so they never land in Terraform state, the task definition JSON, or the console.
-- **Verified with real Terraform, not by eyeballing HCL.** Terraform was not installed locally; rather than mutating the host, the official `hashicorp/terraform:1.9` image was used: `fmt` (found and fixed alignment drift in `main.tf`), then `init` against the real registry, then `validate` — **"Success! The configuration is valid"** against the actual `hashicorp/aws` provider schema. Cleaned up the `.terraform/` provider directory afterward.
-- **Never applied.** No AWS resources were created, so the config is schema-valid but runtime-unverified — task startup, target health, and secret resolution have not been observed. Stated plainly in DESIGN.md rather than implied as working.
-- **`.gitignore`:** added `*.tfstate*`, `*.tfplan`, `.terraform/`, `terraform.tfvars`, while deliberately **tracking** `.terraform.lock.hcl` (it pins provider versions and belongs in VCS). State is the one that matters — it stores resolved `DATABASE_URL` and API keys in plaintext. Verified the rules with `git check-ignore` rather than assuming.
-- **`DEPLOYMENT.md`** covers the hybrid topology end to end: Supabase/Upstash provisioning, SSM secrets, ECR build+push, `terraform init/plan/apply`, `init_db` against Supabase, Vercel config, redeploys, teardown, and cost.
-- **Caught a blocker while writing the deployment doc.** The ALB provisions an HTTP-only listener (an HTTPS one needs an ACM cert + a domain Terraform can't invent). But Vercel serves over HTTPS and browsers **block mixed active content** — so every API call from the deployed frontend to an `http://` ALB would fail, and the stack would look deployed while being completely unusable. `DEPLOYMENT.md` now leads with this warning and documents the ACM + HTTPS listener + HTTP→HTTPS redirect steps.
-- Also flagged two other things that bite in real deploys: `--platform linux/amd64` is required when building on Apple Silicon (Fargate is amd64; an arm64 image dies with an exec format error), and `NEXT_PUBLIC_*` changes on Vercel need a **redeploy**, not a restart, because they're inlined at build time.
+`BackgroundTasks` was chosen over ARQ or Celery deliberately: both need a
+separate worker process, which the free tier doesn't provide. The cost — an
+in-process task doesn't survive a restart — is mitigated by a reaper that
+fails documents stranded in `processing`.
 
-## Project Status — all 12 modules implemented
-- Phase 1 (Modules 1–4) and Phase 2 (Modules 5–12) are all implemented. **114 backend tests pass**; `tsc`, `eslint`, and `next build` are clean; both Docker images build and run; the Terraform config validates.
-- The documentation deliberately stopped short of declaring "100% complete" at this stage, because two material gaps remained open: **RLS was inert** (the application connected as a `BYPASSRLS` superuser, so every policy was bypassed and tenant isolation rested entirely on the application layer), and the **Terraform had never been applied**. `DESIGN.md` instead carried a "Project Status" section stating that all twelve modules were implemented while listing the open gaps under Security / Verification / Deferred product work. *(The RLS gap was subsequently closed — see Day 14.)*
+Two things broke in instructive ways:
 
-## Day 14 - Closing the RLS Gap: Enforced Tenant Isolation
-- The last real blocker to calling this project complete. RLS policies existed and were correct, but the app connected as `postgres` — and **Postgres exempts `SUPERUSER`/`BYPASSRLS` roles from every policy unconditionally**, so tenant isolation rested entirely on application-layer checks.
-- **Probed the semantics against the live database before writing anything**, rather than working from memory. Confirmed four things: (1) a superuser/owner does bypass RLS; (2) after `SET ROLE` to a non-superuser the policy applies and *fails closed* with no session variable; (3) a mismatched tenant variable yields zero rows; (4) with `WITH CHECK` omitted, `USING` governs INSERT too, so a forged row is rejected. That last one meant no extra `WITH CHECK` clauses were needed.
-- **Also discovered `FORCE ROW LEVEL SECURITY` does NOT constrain a superuser** — it only extends policies to the table *owner*. A code comment initially claimed otherwise; the live check disproved it and the comment was corrected. This is recorded explicitly because it is a natural assumption that would leave an operator believing the system was protected when it was not.
-- **The fix: `init_db()` now provisions a restricted role.** `sourceguard_app` is created `LOGIN`, explicitly `NOSUPERUSER NOBYPASSRLS` (in case it pre-existed), granted CRUD + schema `USAGE` and nothing more — no DDL, no ownership. Deliberately *not* the table owner, since an owner bypasses RLS absent `FORCE`, and resting isolation on one easily-missed flag is worse than simply not being the owner. `ALTER DEFAULT PRIVILEGES` covers future tables.
-- Split the connection into `ADMIN_DATABASE_URL` (superuser, DDL only, used by `init_db`) and `DATABASE_URL` (restricted runtime role), with the admin URL falling back to `DATABASE_URL` so a single-URL local bootstrap still works.
-- **Extended RLS to all five tenant tables.** `documents` and `document_chunks` had none — their policies reach the owner through the parent workspace, so a row is visible only when its whole ancestry is owned by the caller. Also folded the `chat_sessions`/`chat_messages` policies into `init_db`: they had been created by the temporary Module 10 migration script, since deleted, so a **fresh bootstrap would have silently produced a database with no chat isolation at all**. `init_db` is now the single source of truth.
-- **Found a genuine latent bug the fix would have exposed.** The tenant variable was set with `set_config(..., true)` — *transaction* scope. Several endpoints commit mid-request (`create_workspace` commits then refreshes; `stream_query` saves the user turn, generates, then saves the assistant turn), and transaction-scoped settings are discarded at each commit. Under enforced RLS every query after the first commit would have correctly returned nothing and broken the request. This was invisible while RLS was inert, because the superuser bypassed the policies anyway. Switched to session scope.
-- Session scope trades one risk for another — a pooled connection could carry one user's context into the next request — so `get_db` now clears the variable in a `finally` on teardown. Verified: after teardown the next session reads `''` and sees zero rows.
-- **`NULLIF` in the policies is load-bearing, not decoration.** `current_setting(..., true)` returns NULL when never set but an *empty string* once cleared, and `''::uuid` raises `invalid input syntax for type uuid` — so clearing the context would have turned every query into an error instead of a clean "no rows". `NULLIF(..., '')::uuid` collapses both cases to NULL and fails closed. Tested both paths explicitly.
-- **Verified end to end against live Postgres as the restricted role:** role attributes `rolsuper=false`/`rolbypassrls=false`; all five tables `relrowsecurity` + `relforcerowsecurity`; user A sees only A's workspaces and B only B's; A cannot insert a row owned by B; no tenant context returns zero rows; cross-tenant document access via the API returns 404; and the full request flow (create → upload → multi-commit streaming query) works, with both chat turns surviving the commits. The 114-test suite still passes unchanged — it runs on SQLite, which has no RLS, which is exactly why the direct Postgres verification was necessary.
-- Updated `README.md` (two-URL setup, corrected security note with a `pg_roles` check operators can run) and `DEPLOYMENT.md` (the runtime connection must not be a superuser — now the most prominent warning in Step 5).
+- A background task outlives the request **and its database session**,
+  including the RLS tenant context. It needed `tenant_session()`, a factory
+  that re-establishes that context on its own connection. It also bypassed
+  FastAPI's dependency overrides, meaning tests were quietly talking to the
+  real `DATABASE_URL` until an injectable session factory was added.
+- A PDF with no text layer produced zero chunks and committed as
+  **`completed`**. No exception, no log, a green `/health` — and a document
+  that appeared ingested while being absent from every answer. Reproduced
+  against live PostgreSQL, then made a failure with an actionable message.
 
-## Final Status — SourceGuard complete
-- **All 12 modules across both phases are complete.** 114 backend tests pass; `tsc`/`eslint`/`next build` clean; both Docker images build and run; Terraform validates; **RLS enforced by the database**.
-- Deferred, documented, and not correctness defects: ALB TLS (needs an ACM certificate and a domain — steps are in `DEPLOYMENT.md`), no interactive browser verification of the frontend (no browser-automation tooling available here), the Terraform has never been applied to a real AWS account, and `Workspace.name` is globally unique rather than per-tenant (a constraint choice, not an isolation gap — RLS now prevents cross-tenant reads regardless).
+**Two silent CORS failures.** Both produced a healthy service and a dead
+frontend. First, a blank `CORS_ALLOWED_ORIGINS` split into an empty list,
+which `CORSMiddleware` enforces as *deny every origin* — diagnosed by probing
+the live preflight and observing that even the default `localhost` origin was
+rejected. Second, JSON-array values were comma-split into fragments after a
+`NoDecode` annotation disabled pydantic-settings' own JSON parsing. Blank now
+falls back to the default with a warning, both encodings parse, and the
+explicit method allow-list was replaced with a wildcard after it silently
+broke `DELETE` preflight the moment deletion routes were added.
 
-## Day 15 - Render Blueprint & a Deployment-Blocking Config Bug
-- Added `render.yaml` at the repository root: Docker runtime, `rootDir: backend`, an explicit `dockerCommand` binding `--port $PORT` (Render assigns the port dynamically, while `backend/Dockerfile` hardcodes 8000 for Compose/ECS parity — overriding here keeps one image identical across local, CI, ECS, and Render), `healthCheckPath: /health`, and a `buildFilter` so docs- or frontend-only commits do not redeploy the API. All secret-bearing variables use `sync: false` so values are entered in the dashboard and never committed.
-- `ADMIN_DATABASE_URL` and `APP_DB_PASSWORD` are deliberately **absent** from the blueprint: they are bootstrap-only credentials with DDL rights, used once locally by `init_db`. Granting the running web service standing superuser access to support a one-time migration would hand every request handler the privileges to drop the schema.
-- **Found and fixed a bug that would have broken every deployment path.** Validating the blueprint's literal values against `Settings` revealed that `CORS_ALLOWED_ORIGINS` — typed `list[str]` — crashed the application at import for *any* plain string value, single origin or comma-separated. pydantic-settings treats `list[str]` as a complex field and runs `json.loads()` on the raw environment value **inside the settings source, before any `field_validator(mode="before")` executes**, so the existing comma-splitting validator never ran. Only a JSON array parsed.
-- Blast radius: `render.yaml`, `docker-compose.yml`, the Terraform task definition, and the `DEPLOYMENT.md` instructions all set this variable as a plain string. `docker compose up` would have crashed on boot. It stayed hidden because local development never sets the variable and falls through to the default, and because `docker compose config` validates the file without starting the service.
-- Fix: annotate the field `Annotated[list[str], NoDecode]`, which suppresses the source-level JSON decode so the existing validator receives the string. Verified across every format a platform might inject — single origin, comma-separated, comma-separated with whitespace, and unset — and confirmed inside the real container image, which now starts with the variable set.
-- Added `TestSettingsEnvParsing` (5 tests) to `tests/test_ingestion.py`, including one asserting the application *imports* with the variable set, since the actual failure mode was a process that never started. **119 tests passing** (114 + 5).
-- Corrected `DESIGN.md`'s Module 4 claim that the value was "overridable in `.env` as a comma-separated string" — accurate in intent, but false in practice until this fix.
+---
 
-## Day 15 (Continued) - Production Incident: Silent Deny-All CORS
-- **Symptom:** the deployed frontend showed "Unable to reach the SourceGuard API at https://sourceguard-backend.onrender.com/api/v1" while the backend was healthy, `NEXT_PUBLIC_API_URL` was correct, and CORS was believed configured.
-- **Frontend audit came back clean.** No hardcoded fallback, no trailing-slash defect, and no build-time misconfiguration: `API_BASE_URL` reads only from `process.env.NEXT_PUBLIC_API_URL` with no `||` default. The error message itself interpolates the correct Render URL, which proves the value was baked into the bundle correctly — the fault was not in the frontend.
-- **Diagnosis by direct probe.** `curl -X OPTIONS` against the live backend with a `Origin` header returned **HTTP 400, body "Disallowed CORS origin", and no `access-control-allow-origin`** — the browser was blocking the request, `fetch` was throwing, and the client's `status === 0` branch reported it as unreachable.
-- **Root cause:** the deployed `CORS_ALLOWED_ORIGINS` was an *empty string*. Probing three origins showed even `http://localhost:3000` — the hardcoded default — was rejected, proving the allow-list was `[]` rather than defaulted. The validator split a blank string into an empty list, and Starlette's CORSMiddleware enforces an empty allow-list as **deny every origin**. `render.yaml` declaring the key with `sync: false` creates it in the dashboard awaiting a value, so leaving it unfilled was sufficient to trigger this.
-- **Why it was invisible:** the failure produces no error, no crash, and no log line. `/health` returns 200, the container is healthy, Render reports a successful deploy, and the only symptom is an opaque client-side message on a different origin.
-- **Fix:** a blank or whitespace-only value now falls back to the default and logs a WARNING rather than silently producing a stricter-than-default deny-all. Blank now behaves like unset, which is the least-surprising semantics, and the misconfiguration is visible in logs instead of only in a browser console.
-- Added `test_blank_value_falls_back_to_default_not_deny_all` covering `""`, whitespace, and `" , , "`. **120 tests passing.**
-- Annotated `render.yaml` and `DEPLOYMENT.md` with the hazard and a `curl` preflight check operators can run to confirm the deployed allow-list, rather than inferring it from the dashboard.
+## Phase 4 — Feature completeness
+
+**Cascading deletion.** `DELETE` endpoints for workspaces and documents,
+relying on `ON DELETE CASCADE` at the foreign-key level rather than the ORM's
+delete-orphan — one statement in the database instead of thousands of loaded
+objects. Both return exact cascade counts, because the blast radius is
+otherwise invisible: the caller asked to delete one workspace and may have
+destroyed thousands of embeddings.
+
+> Writing the tests revealed that SQLite ignores `ON DELETE CASCADE` unless
+> foreign keys are enabled per connection. The existing cascade test had been
+> passing **vacuously** via ORM-level delete-orphan. `PRAGMA foreign_keys=ON`
+> now makes the tests exercise the behaviour production actually relies on.
+
+**Frontend test infrastructure.** Vitest with React Testing Library and jsdom.
+Adding it required bumping `@types/node` from a stale `^20` — matching neither
+CI nor local — to `^22`, and dropping `vite-tsconfig-paths` once Vite 8 made
+path resolution native.
+
+> RTL's `waitFor` deadlocks against `vi.useFakeTimers`, timing out five hook
+> tests. Since the clock is fully controlled in those tests, waiting is
+> deterministic: a `flush()` helper draining microtasks inside `act()`
+> replaced it.
+
+**Auth UI.** Login, signup, password reset, and resend-confirmation. The
+resend sits behind a 60-second cooldown because Supabase rate-limits it with
+an unhelpful 429, and its confirmation is worded to reveal nothing about
+whether an address is registered. A show/hide toggle covers both password
+fields together, and signup validates the confirmation field **before**
+calling Supabase — which has no confirmation concept, so a mistyped password
+would otherwise create a real account the user cannot sign into.
+
+> The middleware initially treated only `/login` as public, making password
+> reset unreachable: a user who has forgotten their password is by definition
+> signed out. `/reset-password` needed exempting for the opposite reason —
+> Supabase exchanges the recovery token for a real session, so the visitor
+> arrives *authenticated* and was redirected away before choosing a password.
+
+**Session persistence and cleanup.** `WorkspaceContext` subscribes to
+Supabase's `onAuthStateChange`: `SIGNED_IN` loads that user's workspaces,
+`SIGNED_OUT` wipes workspaces, active selection, and error state
+synchronously, so no frame can paint the previous user's dashboard.
+`TOKEN_REFRESHED` is deliberately ignored — identity has not changed.
+
+> The callback is deliberately **not** `async`. Supabase serialises auth calls
+> behind a lock, and fetching workspaces resolves a JWT — itself an auth call
+> — so awaiting inside the callback deadlocks. The fetch defers to a
+> macrotask; the sign-out wipe stays synchronous.
+
+**Chat history.** `GET /workspaces/{id}/history` replays a workspace's most
+recent conversation. It returns the **`session_id`**, which matters as much as
+the messages: without it the client would render the restored thread and then
+open a *new* session on the next question, so the model would answer with no
+memory of what is visibly on screen. Only the newest session replays —
+concatenating sessions would splice unrelated conversations into one.
+
+**Persisting the audit trail.** The final gap, and the most important:
+verdicts were computed per response and never stored, so a restored
+conversation showed answers stripped of every verdict — which reads as
+*unverified*, a stronger and wronger claim than *not recorded*.
+
+Migration `003_chat_claims.sql` added a `claims` JSONB column with a partial
+GIN index. Verdicts are written in a two-step: the answer persists when
+streaming ends, verdicts attach afterwards, so a verifier failure costs the
+audit trail rather than the response. Aggregates are derived on read from a
+shared function, so a stored summary can never drift from the claims it
+summarises. `NULL` and `[]` are kept rigorously distinct end to end, and
+historical rows are deliberately not backfilled — re-running the verifier
+would score old answers against today's chunks, and a fabricated audit trail
+is worse than an absent one.
+
+---
+
+## Current state
+
+**250 automated tests** — 169 backend, 81 frontend — running in roughly seven
+seconds combined, with no network, database, or service dependencies.
+Typecheck, lint, and production build are clean.
+
+Behaviour the test suite structurally cannot cover was verified against a
+live PostgreSQL instance with the restricted role: RLS enforcement, cascade
+semantics, and JSONB round-tripping.
+
+Throughout, non-obvious guarantees were checked by **mutation testing** —
+breaking the behaviour deliberately and confirming a test fails. It caught
+several assertions that would have passed against broken code, which is worse
+than having no test at all.

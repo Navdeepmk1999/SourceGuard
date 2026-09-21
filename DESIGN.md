@@ -1,395 +1,395 @@
-# SourceGuard — System Design & Architecture (As-Built)
+# SourceGuard — System Design
 
-This document describes the system **as implemented** across all twelve
-modules of Phases 1 and 2. It records what was built and, where a decision was
-non-obvious, why that option was chosen over the alternatives.
+This document describes the system **as implemented**. It records what was
+built and, where a decision was non-obvious, why that option was chosen over
+the alternatives.
 
-For the fixed engineering standards the codebase is held to, see `CLAUDE.md`.
-For the chronological build history, see `WORKLOG.md`. For deployment
-procedure, see `DEPLOYMENT.md`.
-
-## Technology Stack (As Implemented)
-- **Language & Runtime:** Python 3.11+, FastAPI (async/await), Pydantic v2.
-- **Frontend Stack:** Next.js 14+ (App Router), TypeScript, Tailwind CSS, Lucide React.
-- **Database:** PostgreSQL with the `pgvector` extension, accessed via SQLAlchemy 2.0's async ORM (`asyncpg` driver).
-- **In-Memory Cache:** Redis (Upstash) for semantic query caching and sliding-window rate-limiting.
-- **AI Models:** Groq (chat generation) and Together AI (embeddings) via direct `httpx` calls to their OpenAI-compatible endpoints — both with deterministic, network-free mock fallbacks for local development and testing. No local model downloads (no torch/transformers): claim verification uses a dependency-free keyword-coverage heuristic, designed to be swapped for a real DeBERTa/cross-encoder model later without touching its decomposition/aggregation logic.
-
-## Development Rules
-1. **No Monolithic Files:** Code is modular by concern: routes (`app/api/`), services (`app/services/`), models (`app/models/`), schemas (`app/schemas/`).
-2. **Explicit Error Handling:** Generic `Exception` is never swallowed silently; failures surface as structured `HTTPException` responses (400/404/409/422/502 as appropriate).
-3. **Async First:** All database queries and external API calls are non-blocking (`asyncpg`, `httpx`, SQLAlchemy's async engine).
-4. **Input Verification:** All incoming requests are validated using strict Pydantic schemas (`app/schemas/`).
-5. **Security First:** No hardcoded API keys, database credentials, or JWT secrets — all configuration loads from `.env` via `app/core/config.py`.
+For engineering rules see [`CLAUDE.md`](CLAUDE.md); for build history see
+[`WORKLOG.md`](WORKLOG.md); for deployment see [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 ---
 
-## Module 1: Ingestion & Chunking (As-Built)
+## 1. Data model
 
-**Parsing — `app/services/document_parser.py` (`DocumentParser`)**
-- PDF text extraction via **PyMuPDF** (imported as `pymupdf`; the legacy `fitz` alias is deprecated and was removed from this codebase in Module 12): each page's `get_text()` output is joined with newlines; page count is returned alongside the full text.
-- TXT files are decoded as UTF-8; a `UnicodeDecodeError` is converted into an `HTTPException(422)` rather than propagating a raw exception.
-- Supported extensions are an explicit whitelist (`SUPPORTED_SUFFIXES = {".pdf": ..., ".txt": ...}`); anything else raises `HTTPException(400)`.
+Five tenant-scoped tables, rooted at `workspaces`. Ownership flows outward
+from `workspaces.user_id`; every RLS policy reaches back to it.
 
-**Filename hardening — `DocumentParser._validate_filename()`**
-- Runs *before* any extension check or parsing logic.
-- Rejects a filename if `Path(filename).name != filename` (i.e. it carries directory components — relative traversal like `../../../etc/passwd.pdf` or an absolute path like `/etc/passwd.pdf`), or if the raw string contains a `".."` substring (this also catches Windows-style traversal such as `..\..\windows\system32\evil.pdf`, where backslashes aren't path separators on POSIX and wouldn't otherwise be stripped by `Path.name`).
-- Any violation raises a strict `HTTPException(400)` — never a silent fallback or best-effort sanitization. Covered by dedicated regression tests (`tests/test_document_processing.py::TestDocumentParserSecurity`), including a disguised double-extension case (`invoice.pdf.exe`).
+```
+auth.users (Supabase)
+     │  user_id (uuid, from the verified JWT `sub` claim)
+     ▼
+┌─────────────────┐
+│ workspaces      │  id · user_id · name · created_at
+└────────┬────────┘  UNIQUE(user_id, name)
+         │ ON DELETE CASCADE
+         ├──────────────────────────┐
+         ▼                          ▼
+┌─────────────────┐        ┌──────────────────┐
+│ documents       │        │ chat_sessions    │
+│ id              │        │ id               │
+│ workspace_id FK │        │ workspace_id FK  │
+│ filename        │        │ user_id          │
+│ document_type   │        │ created_at       │
+│ status          │        └────────┬─────────┘
+│ error_message   │                 │ CASCADE
+│ chunk_count     │                 ▼
+│ created_at      │        ┌──────────────────┐
+│ updated_at      │        │ chat_messages    │
+└────────┬────────┘        │ id               │
+         │ CASCADE         │ session_id FK    │
+         ▼                 │ role             │
+┌─────────────────┐        │ content          │
+│ document_chunks │        │ claims  (JSONB)  │
+│ id              │        │ created_at       │
+│ document_id FK  │        └──────────────────┘
+│ content         │
+│ chunk_index     │
+│ embedding       │  VECTOR(3072)
+│ metadata (JSONB)│
+│ created_at      │
+└─────────────────┘
+```
 
-**Chunking — `app/services/chunker.py` (`RecursiveChunker`)**
-- ⚠️ **Superseded for ingestion by Module 11.** `DocumentParser` now routes documents through `LayoutParser` → `SemanticChunker`; `RecursiveChunker` remains in the tree and under test as the fallback for a single element that exceeds the size ceiling on its own. The behavior below still describes that fallback accurately.
-- Wraps LangChain's `RecursiveCharacterTextSplitter` (`chunk_size`/`chunk_overlap` configurable, defaulting to 1000/200 characters; the constructor rejects `chunk_overlap >= chunk_size`).
-- Recomputes each chunk's exact `start_offset`/`end_offset` in the source text via a forward-scanning `text.find()`, so downstream consumers can trace any chunk back to its exact source location.
-- Tags every chunk with metadata: `chunk_size`, `chunk_overlap`, plus any caller-supplied `extra_metadata` (e.g. `filename`, `document_type`).
+### Column notes
 
-**Output contract — `app/schemas/document.py`**
-- `DocumentParser.parse()` returns a `ParsingResult` (`document_id`, `filename`, `document_type`, `total_pages`, `total_chunks`, `chunks: list[DocumentChunk]`) — the single object consumed by both the test suite and the Module 4 upload endpoint.
+**`documents.status`** — `pending | processing | completed | failed`, a
+CHECK-constrained text column rather than a Postgres `ENUM`. Adding a value
+to an enum is a schema migration, and these states are the kind that grow.
+Required because ingestion is asynchronous: the row must carry its own
+progress, since the request that created it is long gone by the time the work
+finishes.
 
----
+**`document_chunks.embedding`** — `VECTOR(3072)`, the native width of
+`gemini-embedding-001`. Narrower Matryoshka widths cannot be requested,
+because Gemini's OpenAI-compatibility layer rejects the `dimensions` field
+with a 400. The width is fixed at DDL time and `create_all` will not alter an
+existing column, so changing providers means dropping and recreating the
+table — which is why the constant lives in `config.py` and is deliberately
+*not* environment-configurable.
 
-## Module 2: Database & Vector Engine (As-Built)
+> 3072 exceeds pgvector's 2000-dimension ceiling for `ivfflat` and `hnsw`
+> indexes. No vector index is defined, so retrieval is a sequential scan.
+> Acceptable at current corpus size; ANN indexing later would need `halfvec`.
 
-**Async engine & session — `app/db/session.py`**
-- `create_async_engine(settings.database_url, ...)` on the `asyncpg` driver, paired with `async_sessionmaker`.
-- `get_db()` is the FastAPI dependency yielding one request-scoped `AsyncSession` per call.
-- `app/db/init_db.py` provides an idempotent async bootstrap: `CREATE EXTENSION IF NOT EXISTS vector` followed by `Base.metadata.create_all`.
+**`chat_messages.claims`** — JSONB, nullable, no default:
 
-**Schema — `app/models/`**
-- `Workspace` (1) → `Document` (many, `ondelete="CASCADE"`) → `DocumentChunk` (many, `ondelete="CASCADE"`); a standalone `AuditLog`.
-- All primary/foreign keys use SQLAlchemy's dialect-portable `Uuid(as_uuid=True)` type (native `UUID` on Postgres, stored as text on SQLite).
+```json
+[{"claim": "Revenue reached 4.2M.", "label": "entailed",
+  "score": 0.83, "supporting_chunk_index": 2}]
+```
 
-**`PortableVector` — `app/models/types.py`**
+`NULL` means *no verdicts stored* — a user turn, or an assistant turn
+predating the column. `[]` means *verified, and nothing was flagged*. The two
+render differently in the UI, so the distinction is load-bearing: collapsing
+them would relabel an unverified answer as clean.
 
-The column type that lets `DocumentChunk.embedding` be a genuine `pgvector` column in production while remaining testable against an in-memory SQLite database, with no parallel "test model" required:
+**`chat_messages.created_at`** — a Python-side default with microsecond
+precision, not `server_default=func.now()`. Conversation ordering depends on
+this column, and SQLite's `now()` resolves only to the second, so sibling
+messages written in one request would tie and replay out of order.
 
-- It is a `TypeDecorator` whose declared `impl` is `Text`, but whose `comparator_factory` is set directly to `pgvector.sqlalchemy.Vector.Comparator`. This means `.cosine_distance()` / `.l2_distance()` / `.max_inner_product()` remain callable on the mapped `embedding` column for query *construction* regardless of which dialect ultimately executes the query.
-- `load_dialect_impl(dialect)`: returns a real `Vector(1536)` (native `VECTOR(1536)`, ANN-indexable) when `dialect.name == "postgresql"`; returns plain `Text` for every other dialect.
-- `process_bind_param` / `process_result_value`: pass the value through untouched on Postgres (pgvector's own driver-level serialization handles it), but `json.dumps`/`json.loads` the float list on any other dialect.
-- Net effect: `tests/test_database.py` runs the *actual* production ORM models — not a mock schema — against `sqlite+aiosqlite:///:memory:`, while the deployed schema uses real `pgvector`.
-- Chunk and audit `metadata` columns use the analogous, simpler pattern: `JSON().with_variant(JSONB(), "postgresql")` — native `JSONB` on Postgres, plain `JSON` elsewhere.
-- `EMBEDDING_DIMENSIONS = 1536` is centralized as a fixed constant in `app/core/config.py` (imported by both `app/models/chunk.py` and `app/services/embeddings.py`) — deliberately *not* a `.env`-configurable `Settings` field, since changing it requires a schema migration, not a config edit.
+### Dialect portability
 
----
-
-## Module 3: Verification & Retrieval Core (As-Built)
-
-**Embeddings — `app/services/embeddings.py` (`EmbeddingService`)**
-- Live path: calls Together AI's OpenAI-compatible `/embeddings` endpoint (async, `httpx`) when `TOGETHER_API_KEY` is configured. Every returned vector's length is validated against `EMBEDDING_DIMENSIONS` (1536); a mismatch or transport failure raises `HTTPException(502)` rather than silently persisting a malformed vector.
-- Mock path (`_mock_embedding`, used whenever no API key is set — the default for local dev/tests): **deterministic** — SHA-256 hash of the input text, first 4 bytes unpacked as a big-endian `uint32` seed, fed into `numpy.random.default_rng(seed).standard_normal(1536)`, then L2-normalized to unit length. Identical text always yields an identical vector; no network call, no model download.
-
-**Hybrid Search & RRF — `app/services/retriever.py`**
-- `build_vector_search_query(workspace_id, query_embedding, limit)` — a pure function producing `SELECT chunk.id, embedding <=> :query AS distance ... ORDER BY distance ASC`, scoped to a workspace via a join to `Document`. The `<=>` cosine-distance operator comes from `PortableVector`'s pgvector comparator.
-- `build_keyword_search_query(workspace_id, query_text, limit)` — a pure function producing Postgres full-text search: `to_tsvector('english', content) @@ plainto_tsquery('english', :query)`, ordered by `ts_rank(...) DESC`.
-- `reciprocal_rank_fusion(ranked_id_lists, k=60)` — merges any number of ranked ID lists using the standard RRF formula, `score(id) = Σ 1 / (k + rank)` (1-indexed rank) summed across every list the id appears in; returns `(id, score)` pairs sorted descending. A pure function with no DB/session dependency, so it's unit-tested directly against synthetic ID lists.
-- `HybridRetriever.hybrid_search()` — orchestrates the two searches against the injected `AsyncSession` and fuses their ranked ID lists via `reciprocal_rank_fusion`, returning the top `top_k` `(chunk_id, score)` pairs. This *is* the hybrid search: dense pgvector ANN + sparse Postgres full-text ranking, merged by rank position (RRF) rather than by blending raw, differently-scaled distance/rank values.
-
-**Claim verification — `app/services/nli_verifier.py` (`NLIVerifierService`)**
-- A dependency-free heuristic verifier (no DeBERTa/cross-encoder download), built to be swapped for a real NLI model later without touching decomposition or aggregation logic.
-- `decompose_claims()` splits a generated answer into sentence-level claims on a sentence-boundary lookbehind regex (`(?<=[.!?])\s+`).
-- `_extract_keywords()` tokenizes to lowercase whole-word tokens (`\b[a-zA-Z0-9]+\b`) and strips a small stopword set.
-- **Word-boundary enforcement (critical security/logic rule):** every keyword-to-chunk match in `_chunk_contains_keyword()` uses `re.search(rf"\b{re.escape(keyword)}\b", chunk_text, re.IGNORECASE)` — the `\b` boundaries are mandatory on both sides. This is what stops a claim keyword like `"cat"` from being falsely counted as present just because the source text contains `"category"` or `"concatenate"`. Covered by an explicit regression test (`test_word_boundary_prevents_partial_substring_match`).
-- `verify_claim()` scores a claim as the fraction of its keywords found (whole-word) in its best-matching chunk, labeling it `ENTAILED` / `NOT_ENTAILED` / `INSUFFICIENT_EVIDENCE` against configurable thresholds (default 0.6 / 0.25). `verify_answer()` aggregates all claims into an `overall_score` and an `is_fully_supported` boolean.
-
----
-
-## Module 4: API & Streaming Gateway (As-Built)
-
-**Workspaces — `app/api/endpoints/workspaces.py`**
-- `POST /api/v1/workspaces` creates a `Workspace`; a duplicate name raises `IntegrityError`, which is caught and converted to `HTTPException(409)`.
-- `GET /api/v1/workspaces` (added in Module 5) lists every workspace newest-first via `select(Workspace).order_by(Workspace.created_at.desc())`, returning `list[WorkspaceRead]`. Both routes are registered on the path `""` rather than `"/"`: since the router already carries the `/api/v1/workspaces` prefix, `"/"` would resolve to `/api/v1/workspaces/` and trigger a FastAPI `307` redirect for the un-slashed URL the frontend requests — an extra hop that also interacts badly with the strict CORS allow-list.
-- `GET /api/v1/workspaces/{workspace_id}/documents` (added in Module 8) returns every `Document` in a workspace, newest-first, each annotated with its `total_chunks` — a value not stored on the `Document` model, so it's computed per-request via `select(Document, func.count(DocumentChunk.id)).outerjoin(DocumentChunk, ...).group_by(Document.id)` rather than a stored column. A plain outerjoin + count + group-by (no Postgres-specific operators), so it runs unmodified against the in-memory SQLite test database as well as Postgres. `HTTPException(404)` if `workspace_id` doesn't exist. Returns `list[DocumentRead]` (`app/schemas/document.py`).
-
-**Document upload — `app/api/endpoints/documents.py`**
-- `POST /api/v1/documents/upload` accepts a `workspace_id` form field and one or more `UploadFile`s (`python-multipart`). Looks up the workspace first (`HTTPException(404)` if it doesn't exist), then per file: reads the raw bytes, calls `DocumentParser.parse()` — inheriting all of Module 1's path-traversal and extension validation for free — persists a `Document` row, batch-embeds every chunk's content via `EmbeddingService.embed_batch()` (Module 3), and inserts one `DocumentChunk` row per chunk with its embedding and metadata. Any single invalid file in a multi-file batch raises immediately (fail-fast `HTTPException`), so a request either fully succeeds or is rejected outright — never partially ingested.
-
-**Generation — `app/services/generation.py` (`GenerationService`, new in Module 4)**
-- The token-streaming counterpart to `EmbeddingService`, following the same live/mock design: when `GROQ_API_KEY` is set, it opens a streaming `POST` to Groq's OpenAI-compatible `/chat/completions` endpoint (`stream: true`), hand-parses the raw `data: {...}` SSE lines, and yields each token's `delta.content` as it arrives — wrapping any transport/parse failure in `HTTPException(502)`. With no key configured, `_mock_stream()` yields the top retrieved chunk's content word-by-word: deterministic, network-free. This service did not exist before Module 4 — none of Modules 1–3 produced generation tokens, and the streaming endpoint needed a concrete token source.
-
-**Testable retrieval — `app/api/deps.py`**
-- `get_hybrid_retriever()` is a FastAPI dependency that builds a `HybridRetriever` from the request's `AsyncSession` and a fresh `EmbeddingService`. Its purpose is testability: `hybrid_search()` issues Postgres-only SQL (pgvector `<=>`, `to_tsvector`) that a SQLite test database cannot execute at all. `tests/test_api.py` overrides exactly this dependency (`app.dependency_overrides[get_hybrid_retriever]`) with a stub returning canned `(chunk_id, score)` pairs, while chunk *content* is still read back from a real in-memory database via a portable `WHERE id IN (...)` query — so generation and verification are still exercised against genuine data end-to-end.
-
-**Streaming endpoint — `app/api/endpoints/query.py`**
-- `POST /api/v1/query/stream`, an `sse_starlette.EventSourceResponse`. Inside `_stream_query_events()`:
-  1. `retriever.hybrid_search(workspace_id, query, top_k)` → ranked chunk IDs (Module 3).
-  2. `_fetch_chunks_in_order()` — a portable `SELECT ... WHERE id IN (...)` — resolves IDs to chunk rows, preserving rank order; if none are found, emits `event: error` and stops.
-  3. `GenerationService.stream_answer()` streams the answer; each token is emitted as `event: token`.
-  4. Once the answer is complete, `NLIVerifierService.verify_answer()` scores every decomposed claim against the retrieved context; each is emitted as `event: verification`.
-  5. A final `event: done` carries the full answer text, `overall_score`, and `is_fully_supported`.
-
-**CORS — `app/main.py`**
-- All three routers are wired via `app.include_router()`.
-- `CORSMiddleware` enforces a strict policy: an explicit origin allow-list (`settings.cors_allowed_origins`, default `["http://localhost:3000"]`, overridable as a comma-separated string via a `field_validator`, which requires the field to be annotated `NoDecode` — pydantic-settings JSON-decodes `list[str]` env values inside the settings source, before any validator runs, so without it a plain origin string raises `SettingsError` at import and the process never starts), `allow_credentials=True`, and methods/headers restricted to exactly what the API needs (`GET`, `POST`, `OPTIONS`; `Content-Type`, `Authorization`) — no wildcard origins, methods, or headers.
+`PortableVector` is a SQLAlchemy `TypeDecorator` whose `impl` is `Text` but
+whose `comparator_factory` is pgvector's. It compiles to a real
+`VECTOR(3072)` on PostgreSQL and a JSON-encoded `Text` column elsewhere. That
+single seam is why 169 backend tests run against in-memory SQLite using the
+**real production ORM models** rather than a parallel mock schema.
 
 ---
 
-## Frontend Architecture (As-Built)
+## 2. Row-Level Security
 
-**Framework & tooling**
-- Next.js 14+ (App Router), TypeScript (strict mode), Tailwind CSS v4 (CSS-first config via `@theme inline` in `src/app/globals.css` — no `tailwind.config.js`), Lucide React for icons.
-- Application code lives under `frontend/src/`: the CLI-generated `app/` directory was relocated to `src/app/` per Next.js's `src`-folder convention, since `src/app` is silently ignored whenever a root-level `app/` also exists. `tsconfig.json`'s `@/*` path alias resolves to `./src/*` accordingly.
+### How a JWT becomes a tenant
 
-**Utility layer — `src/lib/utils.ts`**
-- `cn(...inputs: ClassValue[])` composes `clsx` (conditional class joining) with `tailwind-merge` (last-write-wins conflict resolution for Tailwind utilities — e.g. a later `w-16` correctly overrides an earlier `w-64` in the same class list rather than both being emitted). This is the single class-composition primitive used by every component with conditional or collapsed-state styling.
+```
+1.  Browser         Supabase session → Authorization: Bearer <JWT>
+                        │
+2.  FastAPI         get_current_user()
+                    Verifies ES256 signature against the project's JWKS
+                    (PyJWKClient, cached). Fails closed: 401 on missing,
+                    malformed, expired, or wrong-audience tokens.
+                        │  user_id = JWT `sub`
+3.  FastAPI         get_authenticated_db()
+                    SELECT set_config('app.current_user_id', <user_id>, false)
+                        │                                    └── session scope
+4.  PostgreSQL      Policies evaluate app_current_tenant()
+                        │
+5.  FastAPI         Teardown: set_config('app.current_user_id', '', false)
+                    before the connection returns to the pool
+```
 
-**Structural layout**
-- `src/app/layout.tsx` (Root layout, Server Component): a fixed dark-mode-default shell — `zinc-950` background / `zinc-100` foreground applied directly, with no `prefers-color-scheme` branching or light theme. Renders the persistent `Sidebar` alongside a `min-w-0 flex-1` content region so routed pages fill the remaining width without overflow.
-- `src/components/Sidebar.tsx` (Client Component): toggles between a `w-64` expanded rail and a `w-16` icon-only collapsed rail. Consumes `WorkspaceContext` — fetches on mount, creates via `window.prompt` (a deliberate placeholder pending a real form), highlights the active workspace with `cn()`, and renders distinct loading / error-with-retry / empty (`No workspaces yet.`) states. Nests `src/components/WorkspaceDocuments.tsx` (Module 8) directly under the active workspace's list item — omitted entirely when the sidebar is collapsed, since filenames aren't legible in the icon-only rail.
-- `src/app/(dashboard)/page.tsx` (Client Component; moved under the `(dashboard)` route group in Module 9): now just the dashboard header — workspace name, `DocumentUpload`, and a `ChatPanel` mounted with `key={activeWorkspace?.id}`. All chat state moved into `ChatPanel` in Module 10.
-- `src/components/ChatPanel.tsx` (Client Component, Module 10): owns the conversation and the CSS-grid split into a Chat/Query pane (`minmax(0,1fr)`) and a fixed-width (`360px`) Verification Audit Log pane. Holds `messages: ChatTurn[]` and the active `sessionId`, consumes the `POST /api/v1/query/stream` SSE contract (`session` / `token` / `verification` / `done` / `error`), and renders the thread with per-turn support badges and a live audit pane.
+The tenant resolver, defined in `001_row_level_security.sql`:
 
-**API client — `src/lib/api.ts` (Module 5)**
-- A native `fetch` wrapper over `process.env.NEXT_PUBLIC_API_URL` (set to `http://127.0.0.1:8000/api/v1` in `frontend/.env.local` — the base already carries the `/api/v1` prefix, so route paths are appended bare as `/workspaces`).
-- Exposes `getWorkspaces(): Promise<Workspace[]>` and `createWorkspace(name: string): Promise<Workspace>`, both typed against `src/types/index.ts`. Module 8 adds `getWorkspaceDocuments(workspaceId: string): Promise<WorkspaceDocument[]>` — `WorkspaceDocument` is a distinct type from `Document`, not a reuse of it: the endpoint's response has no `workspace_id` (already scoped by the URL) and adds a `total_chunks` field `Document` doesn't carry.
-- `ApiError extends Error` carries the HTTP `status`, with `status === 0` reserved for requests that never reached the server (transport failure or a CORS rejection) — letting the UI distinguish "backend said no" from "backend unreachable".
-- The response body is read **once as text** and then parsed, rather than calling `response.json()` directly: a non-JSON error payload (an HTML 404 page, a proxy 502) would otherwise throw an opaque parse error that masks the real status. `extractDetail()` normalizes both FastAPI error shapes — `{"detail": "..."}` from explicit `HTTPException`s, and `{"detail": [{"msg": ...}]}` from Pydantic 422 validation failures.
+```sql
+CREATE OR REPLACE FUNCTION app_current_tenant()
+RETURNS uuid LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(
+    NULLIF(current_setting('app.current_user_id', true), '')::uuid,
+    auth.uid()
+  );
+$$;
+```
 
-**Workspace state — `src/context/WorkspaceContext.tsx` (Module 5)**
-- `WorkspaceProvider` holds `workspaces`, `activeWorkspace`, `isLoading`, and `error`, exposing `fetchWorkspaces`, `addWorkspace`, and `setActiveWorkspace`; `useWorkspaces()` throws if consumed outside the provider, so a missing wrapper fails loudly at the call site rather than silently yielding `null` state.
-- `addWorkspace` resolves to `Workspace | null` instead of throwing: the backend's `409` on a duplicate name is an expected outcome of normal user input, so it becomes rendered `error` state rather than an unhandled promise rejection at the click handler.
-- `fetchWorkspaces` clears `activeWorkspace` when the selected workspace is absent from the refreshed list, preventing a stale selection from outliving a server-side deletion.
-- Mounted in `src/app/layout.tsx` around both the `Sidebar` and the routed `children`, so the sidebar list and the page header read the same selection. The layout itself stays a Server Component — only the provider subtree is client-side.
+Three details in that function each earn their place:
 
-**Type contracts — `src/types/index.ts`**
+- **It is not `auth.uid()` alone.** Supabase's documented RLS pattern works
+  only when the caller reaches Postgres through PostgREST, which puts the end
+  user's JWT on the database session. This backend verifies the JWT itself
+  and connects as one long-lived role, so `auth.uid()` is NULL on every
+  backend connection and an `auth.uid()`-only policy would deny every row.
+- **`auth.uid()` is retained as a fallback**, so direct supabase-js access
+  keeps working if the frontend ever queries these tables itself.
+- **`NULLIF` is load-bearing.** `current_setting(name, true)` returns NULL
+  when never set but an *empty string* once cleared, and `''::uuid` raises.
+  Without it, a cleared context turns every query into an error instead of a
+  clean zero-row result. It must fail closed, not fail loudly.
 
-TypeScript interfaces are hand-mirrored from the backend's Python source of truth rather than generated, since no OpenAPI/codegen pipeline exists yet:
-- `Workspace` ← `app/models/workspace.py::Workspace` — `id` / `name` / `created_at`, 1:1 with the SQLAlchemy model's mapped columns.
-- `Document` ← `app/models/document.py::Document` — `document_type` narrowed to the `"pdf" | "txt"` literal union, mirroring `app/schemas/document.py::DocumentType`.
-- `DocumentChunk` ← `app/models/chunk.py::DocumentChunk` — the ORM attribute is `chunk_metadata` (mapped to the `metadata` DB column); the TS field is named `metadata` to match what an eventual response schema would expose, since no Pydantic response schema for this model exists yet.
-- `VerificationResult` / `ClaimVerification` ← `app/services/nli_verifier.py` dataclasses — field-for-field, including `EntailmentLabel` as the `"entailed" | "not_entailed" | "insufficient_evidence"` string union matching the Python `Enum`'s values.
+### The policies
 
-**Current state**
-- Workspace management (Module 5), document upload (Module 6), streaming query + verification (Module 7), and the workspace documents view (Module 8) are all wired end-to-end against the live backend. No frontend surface remains a structural-only placeholder.
-- `tsc --noEmit`, `eslint .`, and `next build` (Turbopack) all pass clean with zero warnings.
-- The browser must reach the app at `http://localhost:3000`, not `http://127.0.0.1:3000` — `settings.cors_allowed_origins` defaults to the former only, and the two are distinct origins to the browser's CORS check.
-- Outstanding from earlier modules: the "New Workspace" flow still uses `window.prompt` rather than an in-app form (Module 5). `GET /workspaces` (Module 5, `TestWorkspaceListing`) and `GET /workspaces/{workspace_id}/documents` (Module 8, `TestWorkspaceDocuments`) both have committed regression tests in `tests/test_api.py` — 65 backend tests passing overall.
-
-### Frontend Execution Roadmap
-
-**Module 5 — Workspace Architecture — ✅ Implemented**
-- Shipped as `src/lib/api.ts` (a single flat module rather than the planned `src/lib/api/workspaces.ts`, since two endpoints did not warrant a directory) plus `src/context/WorkspaceContext.tsx` — both documented under "Frontend Architecture (As-Built)" above.
-- The planned backend prerequisite is resolved: `GET /api/v1/workspaces` was added to `app/api/endpoints/workspaces.py` as part of this module.
-- Deferred from this pass: the "New Workspace" flow uses `window.prompt` rather than an in-app form, and the new `GET` route has no committed regression tests (it was verified ad-hoc against the in-memory SQLite fixtures).
-
-**Module 6 — Document Upload — `src/components/DocumentUpload.tsx` — ✅ Implemented**
-- Replaces the dashboard header placeholder with a live, context-aware upload button. Disables automatically if `activeWorkspace` is null or if an upload is currently in flight.
-- Uses a hidden `<input type="file" accept=".pdf,.txt" />` triggered via a styled `<button>` to enforce allowed extensions natively at the OS file-picker level.
-- Incorporates a lightweight, custom toast notification system to display success states or explicitly surface the backend's 400/422 rejection details (e.g., path traversal attempts, unsupported files) without adding third-party dependencies.
-- `src/lib/api.ts` was updated to omit the `Content-Type: application/json` header when the body is `FormData`, allowing the browser to correctly set the multipart boundary.
-
-**Module 7 — Streaming Chat & Audit Log — `src/app/page.tsx` — ✅ Implemented**
-- Consumes `POST /api/v1/query/stream` via a custom async generator (`streamQuery` in `api.ts`) that reads the `ReadableStream` and parses `\r\n`-terminated SSE frames natively, bypassing the GET-only limitations of the browser's `EventSource`.
-- Real-time state machine accumulates `event: token` frames into the live answer block, and pushes `event: verification` frames into a dedicated Audit Log array.
-- Claims in the Audit Log are visually color-coded using `cn()` and Tailwind based on their `EntailmentLabel` (emerald for entailed, amber for insufficient, red for not_entailed).
-- Fails safely: handles pre-stream API errors (e.g., 404 for an invalid workspace) and gracefully ignores missing optional fields (like `supporting_chunk_index`) from the backend payload.
-
-**Module 8 — Workspace Documents View — `src/components/WorkspaceDocuments.tsx` — ✅ Implemented**
-- Backend: `GET /api/v1/workspaces/{workspace_id}/documents` added to `app/api/endpoints/workspaces.py`, returning `list[DocumentRead]` (`app/schemas/document.py`) — each entry carries a `total_chunks` count computed via an outerjoin + `func.count(...)` + `group_by(Document.id)`, portable across the SQLite test DB and Postgres. `HTTPException(404)` for an unknown workspace, matching the existing route's convention.
-- Frontend: `getWorkspaceDocuments(workspaceId)` added to `api.ts`, typed against the new `WorkspaceDocument` interface — deliberately not `Document[]`, since the wire shape differs (no `workspace_id`, plus the computed `total_chunks`).
-- `WorkspaceDocuments` is a new, self-contained Client Component (mirroring `DocumentUpload`'s file-per-concern granularity) that fetches on mount and on `workspaceId` change, using a `cancelled`-flag effect to avoid a race when the active workspace changes mid-fetch. Renders loading / error / empty / populated states; each populated row shows the filename (with a `lucide-react` `FileText` icon, truncated with a `title` tooltip) and its chunk count.
-- Nested inside `Sidebar.tsx`'s active workspace `<li>`, shown only when that workspace is both selected and the sidebar is expanded (`!collapsed`) — collapsed icon-only mode has no room for filenames.
-- `TestWorkspaceDocuments` in `tests/test_api.py` covers the 404 case, the empty-list case, newest-first ordering, and the `DocumentRead` shape with correct `total_chunks` aggregation. Also verified via a direct SQLite-backed integration run and, on the frontend side, by exercising the real `getWorkspaceDocuments` export against a live instance of the actual backend.
-
-**Module 9 — Enterprise Security & Multi-Tenancy — ✅ Implemented (Auth + RLS + Rate Limiting)**
-- **Frontend:** `src/app/login/page.tsx` is a dark-themed login/signup form built on `@supabase/supabase-js` via `src/lib/supabase/client.ts`. `src/proxy.ts` gates the dashboard: redirects an unauthenticated request to `/login` and a signed-in request away from `/login`, using `@supabase/ssr`'s `createServerClient` + `supabase.auth.getUser()` (a server-revalidated check, not a locally-decoded cookie, so an expired/tampered cookie can't pass). Filed as `proxy.ts`, not `middleware.ts`: Next.js 16 renamed the file convention (the old name still works as a deprecated compatibility shim, but this pinned version's own docs - see `frontend/AGENTS.md`'s warning to check `node_modules/next/dist/docs/` - call out `proxy` as current).
-- The root layout (`src/app/layout.tsx`) was split via a new `(dashboard)` route group (`src/app/(dashboard)/layout.tsx` + `page.tsx`) so `/login` renders standalone, without the `Sidebar`/`WorkspaceProvider` shell trying to fetch workspaces while unauthenticated.
-- `src/lib/api.ts`'s `request()` and `streamQuery()` both call a new `getAuthHeaders()` that reads the active Supabase session and injects `Authorization: Bearer <access_token>` into every backend call. `Sidebar.tsx` gained a "Sign Out" button (`supabase.auth.signOut()`, then redirect to `/login`).
-- **Backend:** `app/models/workspace.py` gained a `user_id` (UUID, `NOT NULL`) column - the owning Supabase `auth.users.id`. No local `ForeignKey`: Supabase Auth owns that table, and this app's ORM doesn't model the `auth` schema (nor does that schema exist on the SQLite test database).
-- `app/api/deps.py::get_current_user` extracts the `Authorization: Bearer <jwt>` header and verifies it via JWKS - `algorithms=["ES256"]`, `audience="authenticated"` - not a shared HS256 secret: reading `{SUPABASE_URL}/auth/v1/.well-known/jwks.json` directly showed this project's published signing key is ES256 (Supabase's newer, asymmetric JWT-signing-keys scheme), so a static secret could never verify its tokens (this is exactly what an initial HS256-based implementation surfaced as `InvalidAlgorithmError`). `PyJWKClient` (cached per URL via `_get_jwk_client`, itself caching the fetched key set for 5 minutes) resolves the correct public key per token, then `jwt.decode()` verifies against it, returning the token's `sub` claim as the user id. Fails closed: `401` for a missing/invalid/wrong-audience token or an unresolvable signing key, `500` if `SUPABASE_URL` isn't configured - it never lets a request through unauthenticated.
-- `app/api/deps.py::get_authenticated_db` composes `get_db` + `get_current_user` into a session with the RLS tenant context set via `SELECT set_config('app.current_user_id', :user_id, true)` - not a literal `SET LOCAL app.current_user_id = ...` as originally sketched, since a bare `SET` statement can't take a bind parameter under asyncpg's extended query protocol; `set_config` is the standard parameterized idiom for this exact pattern. A no-op on non-Postgres dialects (the SQLite test engine), mirroring `PortableVector`'s dialect-gated behavior.
-- `app/db/init_db.py` now (Postgres only) runs `ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY` and creates a `workspace_isolation` policy: `USING (user_id = current_setting('app.current_user_id', true)::uuid)`. The `true` (missing_ok) argument to `current_setting` means an unauthenticated/misconfigured session reads the setting as NULL, so the policy fails closed to "no rows visible" rather than raising a raw, unhandled Postgres error. `DROP POLICY IF EXISTS` runs first, since Postgres has no `CREATE POLICY IF NOT EXISTS` - keeps `init_db()` safely re-runnable per its existing idempotent-bootstrap contract.
-- `get_authenticated_db` (not plain `get_db`) now backs every endpoint that touches `workspaces` - `list_workspaces`, `create_workspace` (which also stamps the new `user_id`, from `get_current_user`, onto every workspace it creates), `list_workspace_documents`, `upload_documents`, and `stream_query` - all five call `session.get(Workspace, ...)` or `SELECT ... FROM workspaces`, so once RLS is enabled every one of them would otherwise silently return nothing (or a false 404) for a legitimate authenticated user. This is broader than "update the Workspace creation endpoint" alone: leaving the read/upload/query routes on plain `get_db` would either break them outright under RLS, or leave an unauthenticated hole sitting right next to a "secured" create route.
-- **`ensure_workspace_owner()` (app/api/deps.py):** the first pass of this module left every workspace-scoped endpoint checking only that a workspace *existed* (`if workspace is None: raise 404`), never that the caller *owned* it — combined with RLS being a no-op on the SQLite test database, cross-user isolation had no enforcement at all outside a real Postgres+RLS deployment. `ensure_workspace_owner()` compares `workspace.user_id` against the authenticated caller (same 404 either way, so a mismatch can't be distinguished from nonexistence) and is wired into `list_workspace_documents`, `upload_documents`, and `stream_query`; `list_workspaces` additionally filters its own query by `WHERE user_id = :caller`. This is deliberate defense-in-depth alongside Postgres RLS, not a replacement for it - RLS still protects a direct SQL connection that bypasses the API entirely, which an app-layer check cannot.
-- **`tests/test_security.py`** now covers `TestJWTValidation` (missing/malformed/invalid-signature/expired/wrong-audience/missing-`sub` tokens, plus a valid-token control, against the real - not stubbed - `get_current_user`), `TestCrossUserIsolation` (User B blocked from User A's workspace via listing/documents/upload/query-stream, plus a control confirming User A retains access), and `TestOwnershipStamping` (reads the `Workspace` row back from the DB to confirm `user_id` was actually persisted).
-- **Redis Rate Limiting (`app/api/deps.py`):** a sliding-window-log limiter, keyed strictly by authenticated `user_id` (not IP, so it can't be sidestepped by rotating source addresses) via a Redis sorted set - `_SLIDING_WINDOW_SCRIPT` runs `ZREMRANGEBYSCORE` (drop entries older than the window) + `ZCARD` (count what's left) + the limit check + `ZADD` as a single atomic `EVAL`, so concurrent requests from the same user can't race between "check" and "record" and both slip through over the limit. `rate_limit_user` (10 req/60s) is applied to `POST /api/v1/query/stream` - the LLM-backed endpoint and primary Denial-of-Wallet exposure - via route-level `dependencies=[Depends(rate_limit_user)]`. `rate_limit_upload` (20 req/60s, looser - storage/embedding-cost protection, not the primary DoW target) is applied the same way to `POST /api/v1/documents/upload`. Both raise `HTTPException(429)` once exceeded.
-- `TestQueryRateLimiting` in `tests/test_security.py` covers requests under the limit passing through to normal processing, the request that trips the threshold returning `429`, and that one user's exhausted budget doesn't affect another's - using an in-memory `_FakeRedis` that reimplements the Lua script's exact semantics, not a real Redis connection. This wasn't just convenience: the real async Redis client's connection pool binds to the event loop it was created in, and caching one client per URL (the same pattern used for `_get_jwk_client`) breaks across pytest-asyncio's per-test event loops with `RuntimeError: Event loop is closed` - `get_redis_client` needed to be overridable in tests for exactly this reason, independent of wanting to avoid a real Redis dependency in CI.
-- Verified directly against the real Redis container (`sourceguard-db`'s sibling `genegenius-redis`, already running locally) with the actual `_check_rate_limit`/`get_redis_client` functions, not a reimplementation: ten requests allowed, then denied, cleanly.
-- **Rate limiter fail-open:** `_check_rate_limit` catches `RedisError` and returns `True` (allow), logging at WARNING. Deliberate availability-over-enforcement tradeoff: without it a Redis outage 500s every rate-limited route, turning degraded protection into a total API outage. The cost is that Denial-of-Wallet protection is *disabled* during such an outage, so Redis availability is part of the cost-control story rather than an optional dependency. Covered by `test_rate_limiter_fails_open_when_redis_is_unavailable`, which drives a client whose `eval` raises `redis.exceptions.ConnectionError` (a `RedisError` - deliberately not Python's builtin `ConnectionError`, which is an `OSError` and would *not* be caught).
-- **✅ RLS IS NOW ENFORCED** (closed after Module 12; see the "Row-Level Security enforcement" section below). It was previously inert: the app connected as `postgres`, which carries `rolsuper` and `rolbypassrls`, so every policy was bypassed at runtime. The application now connects as a restricted role and isolation is enforced by the database itself, verified by cross-tenant reads that return zero rows.
-- **Known gaps, still not addressed:** RLS (once actually enforcing, per the item above) covers `workspaces`, `chat_sessions`, and `chat_messages`, but not `documents`/`document_chunks`. `Workspace.name`'s uniqueness constraint is still global, not scoped per-user. The RLS policies and the `set_config` wiring in `get_authenticated_db` remain untestable in the pytest suite (SQLite has no RLS); only the SQLite-testable application-layer checks have committed coverage.
-
-**Module 10 — Contextual Intelligence & Conversation Memory — ✅ Implemented**
-- **Schema (`app/models/chat.py`):** `ChatSession` (`id`, `workspace_id` FK → `workspaces` CASCADE, `user_id`, `created_at`) and `ChatMessage` (`id`, `session_id` FK → `chat_sessions` CASCADE, `role`, `content`, `created_at`). `role` uses `Enum(MessageRole, native_enum=False)` → a portable `VARCHAR(16)` rather than a Postgres native `ENUM`, so the same DDL renders on Postgres and the SQLite test DB with no `CREATE TYPE` for the migration and `create_all` to keep in sync.
-- `ChatMessage.created_at` uses a **Python-side** `default=lambda: datetime.now(UTC)`, not `server_default=func.now()` like every other model here. Conversation ordering depends on this column and SQLite's `now()` resolves only to the second, so sibling messages written within one request would tie and history could replay out of order - the same resolution limit that previously forced explicit timestamps in the workspace/document ordering tests.
-- **Session lifecycle (`app/services/conversation.py`):** `get_or_create_session` resolves a supplied `session_id` or creates a new session, raising `LookupError` → `404` when the id is unknown, owned by another user, **or belongs to a different workspace** (otherwise a session id could splice one workspace's conversation into another workspace's retrieval context). Resolved in the *endpoint*, before `EventSourceResponse` is returned: once streaming starts the status line is committed and a bad id could only be reported as an in-band SSE `error`, not a real 404.
-- **Sliding window:** `load_recent_messages` fetches the newest `HISTORY_WINDOW_SIZE` (10) messages with `ORDER BY created_at DESC LIMIT 10` (the database does the windowing rather than loading a whole long conversation into memory) then reverses to chronological order, which is what the model needs. History is loaded *before* the current question is persisted, so the current turn isn't replayed back as if it were prior context.
-- **Prompt injection (`GenerationService.stream_answer(..., history=...)`):** prior turns are spliced in as their own `{role, content}` messages ahead of the final user message, not flattened into the prompt string, so the model sees a real multi-turn exchange with correct role attribution. Both turns are persisted per request (user before generation, assistant after).
-- **SSE contract:** a new `session` event is emitted first carrying `session_id` (so a client that started a fresh conversation learns the id immediately, even if the stream later errors), and `session_id` is also included on `done`. Both are backward-compatible - the frontend's `toQueryStreamEvent` returns `null` for unrecognized event names and reads named fields off `done`.
-- **LangSmith telemetry (`app/services/telemetry.py`):** ⚠️ **`LANGCHAIN_TRACING_V2=true` alone traces nothing in this codebase.** That variable enables auto-instrumentation of LangChain/LangGraph *runnables*, and this backend has none: generation is a raw `httpx` stream to Groq, retrieval is hand-written SQL, verification is a dependency-free heuristic, and the single `langchain` import anywhere is `RecursiveCharacterTextSplitter` (a pure string splitter that never calls a model). Tracing is therefore emitted by explicit `@traceable` spans via a `traced()` wrapper on `_stream_query_events`, `_retrieve_context`, and `_verify_answer`. The standard env vars still act as the on/off switch (`LANGCHAIN_TRACING_V2` and the current `LANGSMITH_TRACING` are both read), and `Settings.tracing_enabled` additionally requires an API key - a key-less "enabled" would make every traced call emit failing network requests on the request path. `traced()` resolves once at import time and is a zero-overhead passthrough when off.
-- **Tests:** `TestConversationMemory` in `tests/test_api.py` (8 tests) covers new-session creation, both turns persisted with correct roles/order, session reuse accumulating history, chronological ordering, the 10-message window cap, unknown-`session_id` → 404, cross-workspace session → 404, and - via a spy on `GenerationService.stream_answer` - that history actually reaches the generator (the mock token stream ignores `history`, so every other test would pass even if it were never wired through).
-
-**Module 10 (frontend) — Multi-Turn Chat UI — ✅ Implemented**
-- **API client:** `streamQuery(workspaceId, query, sessionId = null)` sends `session_id` in the request body; `QueryStreamEvent` gained a `session` variant and `session_id` on `done`. `done.session_id` is parsed defensively (absent → `null` rather than rejecting the whole frame) since the `session` event is the primary carrier and a `done` without it is still a usable answer.
-- **`src/components/ChatPanel.tsx`:** replaces the previous single `submittedQuery`/`answer` pair with `messages: ChatTurn[]` (`{ id, role, content, claims?, overallScore?, isFullySupported?, error? }`). Each turn owns its own verification results and support badge, so scrollback stays accurate rather than every answer sharing one global claim list. Turns are updated by `id` (a `crypto.randomUUID()` generated at submit time) rather than by array position, so a stray concurrent update can't corrupt the wrong turn.
-- The `sessionId` is captured from the `session` event, which the backend emits *before* any token - so a brand-new conversation is continuable from the very next turn even if the stream later errors. `done.session_id` is also honored as a fallback.
-- **Workspace switching resets via React's `key` prop, not a reset `useEffect`.** `page.tsx` mounts `<ChatPanel key={activeWorkspace?.id ?? "no-workspace"} />`, so switching workspaces remounts the component and `messages`/`sessionId` reset for free. Two reasons this is the right shape rather than a stylistic preference: (1) resetting state on a prop change via `setState` inside `useEffect` is precisely what this repo's lint config rejects (`react-hooks/set-state-in-effect`, which previously forced the async-function restructure in `WorkspaceDocuments`), and keying is React's documented alternative; (2) it is correct on the merits - a chat session is workspace-scoped server-side (`get_or_create_session` 404s a `session_id` used against a different workspace), so carrying a thread or session id across a switch would be wrong regardless of how the reset were implemented.
-- **Auto-scroll** depends on both `messages.length` *and* the latest turn's content, so the view keeps following a long answer as tokens stream in rather than jumping only once per turn.
-- **`SubmitEvent`, not `FormEvent`:** `@types/react` marks `FormEvent` `@deprecated` with "doesn't actually exist … you probably meant `SubmitEvent`". Per `frontend/AGENTS.md` ("heed deprecation notices"), the new component uses `SubmitEvent<HTMLFormElement>`. The prior code used `FormEvent`; it was a hint-level diagnostic, not an error, so nothing was broken by it.
-- **Verified** with `tsc --noEmit`, `eslint .`, and `next build` all clean, plus an end-to-end run of the real `streamQuery` export against the real backend and real Postgres: turn 1 with `session_id: null` created a session (id matching on both the `session` and `done` events), turn 2 reused it, and the database showed one session with four correctly-ordered alternating messages - the second answer responding contextually to the follow-up, which is direct evidence history reached the live model rather than merely being stored. Not verified: interactive browser click-through (typing, watching the thread scroll), as no browser-automation tool is available in this environment.
-
-**Module 11 — Advanced Data Ingestion — ✅ Implemented**
-- **Chose PyMuPDF over `unstructured`.** The brief suggested either; PyMuPDF wins decisively *for this project* because it is already the PDF dependency and, since 1.23, ships `Page.find_tables()` plus per-span font metadata via `get_text("dict")` — enough for table extraction and heading detection with **zero new packages and zero system-level dependencies**. `unstructured`'s high-fidelity PDF path wants `poppler`/`tesseract` and downloads ONNX/detectron layout weights on first use, which would violate two standing constraints stated in this document: "No local model downloads" and the deterministic, network-free offline dev/test path. Capabilities were verified empirically against this pinned PyMuPDF 1.28 (real table extraction, real font metadata) *before* committing to the approach rather than assumed from version numbers.
-- **`app/services/layout_parser.py` (`LayoutParser`)** emits ordered `LayoutElement`s (`HEADING` / `PARAGRAPH` / `LIST_ITEM` / `TABLE`) instead of one flat text blob.
-  - *Heading detection is relative, not absolute:* a span is a heading when it exceeds the document's own body font size by `_HEADING_SIZE_RATIO` (1.15), where the baseline is the **character-count-weighted median** of all span sizes — so a handful of large title spans can't drag the baseline up and cause every paragraph to be misclassified. Short bold non-sentence lines and Markdown `#` prefixes also qualify, catching headings that carry no size change.
-  - *Tables* are extracted via `find_tables()` and rendered with `to_markdown()`, so row/column relationships survive into the embedded text (`|Region|Revenue|Growth|`) rather than collapsing into positional noise.
-  - *Table-region text suppression:* cell text also exists in the page's ordinary text layer. Blocks whose overlap with a detected table bbox exceeds 50% are skipped, otherwise every cell would be emitted a **second** time as loose prose — duplicating content and stripping exactly the structure the Markdown form exists to preserve. Covered by a dedicated regression test.
-  - Tables are located first because their bounding boxes determine which text blocks to suppress; elements are then re-sorted by vertical position into true reading order.
-  - A block's visual lines are joined with `"\n"`, not `""`. Consecutive list items frequently land in a single PyMuPDF block, and a bare join welded them into `"...growth- EMEA improved..."` — caught during implementation and pinned by a regression test.
-  - Table detection is best-effort: a page whose vector graphics confuse the finder still yields its text rather than failing the upload with a 422.
-- **`app/services/semantic_chunker.py` (`SemanticChunker`)** groups elements under three rules: (1) **tables are atomic** — never split, never merged with surrounding prose; (2) **headings bind to the content they introduce**, and are re-prepended as context to continuation chunks so a chunk retrieved in isolation still names its section; (3) **size is a ceiling, not a target** — elements pack until the next would exceed it, so the split lands on an element boundary rather than mid-sentence.
-- **Atomic tables are exempt from the oversized-element fallback.** This was a genuine bug caught by a test written before the fix: the fallback split *any* single element over the ceiling, shredding a large table into 72 fragments. Splitting a table drops its header row, making every subsequent fragment's cells uninterpretable — the precise failure this module exists to prevent — so an oversized table is now emitted whole. The tradeoff is deliberate: a table larger than the embedding context gets truncated at embed time (degrading one chunk), whereas splitting corrupts the column semantics of all of them.
-- **Heading-only groups are folded forward.** A document title immediately followed by a section heading would otherwise emit the title as a standalone chunk of a few words — near-useless to retrieve and dilutive to the index. Merged into the following group when the result stays within the ceiling, and never into an atomic table group.
-- **Offset traceability is preserved.** Module 1's guarantee that a chunk maps back to its source survives the switch from character slicing to element assembly: the chunker reconstructs the canonical document text, records each element's exact span, and derives chunk offsets from element positions. Because chunks are contiguous element runs, `source[start:end] == content` holds exactly — asserted by a test. The one documented exception is a continuation chunk carrying a re-prepended heading, where offsets cover the body only and `heading_prefixed: true` flags it.
-- **Plain text** gets the same treatment via the structure it actually carries — blank-line paragraph separation, Markdown `#` headings, `-`/`1.` list markers — so `.txt` ingestion is also boundary-aware rather than character-sliced.
-- **Chunk metadata** now carries `strategy: "semantic_layout"`, `element_types`, `contains_table`, `section`, `pages`, and `heading_prefixed`, giving retrieval and the audit UI real structural context.
-- **Dependencies:** none added. `requirements.txt` annotates why `pymupdf` now carries the layout role, and `README.md` documents that **no `poppler`/`tesseract` step exists** — so there is no fallback path to provide, which was the point of choosing this strategy.
-- **Tests:** `tests/test_ingestion.py` (23 tests) across layout classification, Markdown table fidelity, table-text de-duplication, list-welding, plain-text structure, and the three boundary rules — including that an oversized table stays whole, that splits land on element boundaries, and that offsets round-trip to the source. Full suite: **114 passing**.
-
-**Module 12 — DevOps & Cloud Orchestration — ✅ Implemented (containerization, CI, and IaC)**
-- **`backend/Dockerfile`:** `python:3.11-slim`, `requirements.txt` copied and installed *before* application code so the dependency layer is keyed only on the lockfile — editing a source file rebuilds from the `COPY . .` step rather than reinstalling every package. Runs as a non-root `appuser` (uid 10001) created *after* the pip layer so user setup can't invalidate it. `HEALTHCHECK` hits the existing `/health` route through `urllib` rather than `curl`/`wget`, neither of which exists in `-slim` — adding one purely for a healthcheck would grow the image for nothing.
-- **`frontend/Dockerfile`:** three stages — `deps` (`npm ci`, keyed on the lockfile), `builder` (`npm run build`), `runner` (standalone output only), on `node:22-alpine` with `libc6-compat` for the glibc symbols Next's precompiled binaries expect. Runs as non-root `nextjs`.
-  - `next.config.ts` now sets `output: "standalone"`, so the runtime stage ships `server.js` plus only the `node_modules` actually needed instead of the full tree.
-  - **`public/` and `.next/static/` are copied in explicitly.** Next.js deliberately omits both from standalone output (it assumes a CDN serves them) — this version's own docs call it out. Without those two `COPY` lines the app boots and then 404s every stylesheet, script chunk, and font. Verified by serving the running container and asserting a `.next/static` chunk and `public/next.svg` both return 200.
-  - **`NEXT_PUBLIC_*` are build ARGs, not runtime env.** Next inlines them into the client bundle during `next build`; supplying them only at `docker run` would silently ship a bundle with `undefined` baked in. Verified by grepping the built image and confirming both the API URL and Supabase URL are present in the emitted chunks.
-- **`docker-compose.yml`** defines `backend` and `frontend` only. **Postgres and Redis are deliberately excluded:** this project's local setup already runs them as standalone containers on 5432/6379, so declaring them again would collide on those ports and risk a second, empty database silently shadowing the real one. The services reach them over `host.docker.internal` (with an `extra_hosts: host-gateway` mapping so this also resolves on Linux, not just Docker Desktop). Verified by querying the real Postgres from inside a container.
-  - Backend config is inherited from `backend/.env` via `env_file` (marked `required: false` so compose works before the file exists), with `DATABASE_URL`/`REDIS_URL` overridden because `localhost` inside a container is the container itself, not the host.
-  - `NEXT_PUBLIC_API_URL` defaults to `http://localhost:8000/api/v1`, **not** `http://backend:8000` — that URL is fetched by the user's *browser*, which runs on the host and cannot resolve compose service names.
-  - The frontend waits on `depends_on: condition: service_healthy`, which is why the backend carries a healthcheck at all.
-- **`.github/workflows/ci.yml`** runs on push and pull_request against `main`, with a `concurrency` group that cancels superseded runs. Two jobs: **backend** (Python 3.11, pip-cached, `pytest`) and **frontend** (Node 22, npm-cached, `tsc --noEmit` + `eslint` + `next build`). No `services:` block is needed — the suite runs on in-memory SQLite with Redis faked and, with no AI keys set, the deterministic offline mocks — so CI needs no Postgres, no Redis, and no network egress.
-- **Verified by building and running, not by inspection.** Both images were built locally; the backend image ran the full suite — **114/114 passing on Python 3.11**, which also confirms 3.11 compatibility that local development (3.14) never exercises. The frontend container was started and confirmed to redirect `/` → `/login`, serve `/login` at 200, and serve both static and `public/` assets. `docker compose config` validates and resolves as intended.
-- **PyMuPDF import modernized (follow-up, now done):** the 3.11 container run surfaced `DeprecationWarning: The 'fitz' API is deprecated ... Use 'import pymupdf' instead.` Renamed `import fitz` → `import pymupdf` across `document_parser.py`, `layout_parser.py`, and the two test modules that build fixture PDFs (`test_document_processing.py`, `test_ingestion.py`) — the warning fires on the import itself, so the test files mattered as much as the services. `pymupdf.open`/`Document`/`Rect`/`Page` were confirmed to be the *same objects* as their `fitz` counterparts before renaming, so this is an alias change with no behavioral difference. Verified in the CI-equivalent 3.11 container: `python -W error::DeprecationWarning -c "import app.main"` passes, and the suite runs 114/114.
-- The one remaining warning in that container comes from `starlette/testclient.py` (`anyio.abc.BlockingPortal` alias deprecated) — third-party code, not this project's, and not suppressed.
-
-**Module 12 (continued) — Infrastructure as Code & Hybrid Deployment — ✅ Implemented**
-- **`infrastructure/` (Terraform, AWS provider ~> 5.0):** `main.tf`, `variables.tf`, `outputs.tf`, plus a tracked `terraform.tfvars.example`. Provisions a VPC with two public subnets across distinct AZs (an ALB requires a minimum of two — enforced by a `validation` block on the CIDR list rather than left to fail at apply time), an internet gateway and route table, two security groups, an Application Load Balancer with an HTTP listener and target group, a CloudWatch log group, an ECS cluster, a Fargate task definition, and the ECS service.
-- **ECS on Fargate, not EC2** (the roadmap line said "AWS EC2/RDS"): the deliverable asked explicitly for ECS + Fargate, and RDS is superseded by Supabase, which already provides Postgres *and* the Auth/JWKS issuer that Module 9's token verification depends on. Running RDS as well would mean two Postgres instances and a second identity story.
-- **Security groups implement least privilege rather than the literal brief.** The request was "allow ingress on port 8000"; opening 8000 to `0.0.0.0/0` would let callers reach tasks directly and bypass the load balancer entirely. Instead the ALB security group takes 80/443 from the internet, and the task security group accepts 8000 **only from the ALB's security group**. That satisfies the requirement while keeping the API reachable through exactly one path.
-- **Tasks run in public subnets with `assign_public_ip = true`** — a deliberate cost tradeoff, documented in-file. Fargate in a private subnet needs a NAT gateway (~$32/mo) to pull from ECR and reach Supabase/Upstash/Groq. The security group is what provides isolation here, not subnet placement. Without the public IP the task cannot pull its image and silently fails to start.
-- **Two IAM roles, kept separate.** The *execution* role is assumed by the ECS agent to pull the image and write logs (`AmazonECSTaskExecutionRolePolicy`), plus an inline policy granting `ssm:GetParameters`/`secretsmanager:GetSecretValue` scoped to exactly the ARNs passed in — the managed policy does **not** cover secret reads, so the `secrets` block fails at task start without it. The *task* role, assumed by the application, is intentionally empty: the backend talks only to Supabase, Upstash, and HTTP AI providers and needs no AWS API access. It exists as the attachment point for future grants and to keep application permissions distinct from the agent's.
-- **Secrets never enter Terraform state or the task definition.** They are referenced by SSM/Secrets Manager ARN through the task definition's `secrets` block and resolved by the agent at task start. Non-secret config (`ENVIRONMENT`, `CORS_ALLOWED_ORIGINS`, `SUPABASE_URL`) is plain `environment`.
-- The target group uses `target_type = "ip"` (required for Fargate — tasks register by ENI address, there is no instance to attach), health-checks the existing `/health` route, and sets `deregistration_delay = 30` so in-flight SSE streams can finish without the default 300s stalling every deploy. The service sets `lifecycle.ignore_changes = [task_definition]` so Terraform does not revert an image deploy performed by `aws ecs update-service`.
-- **`DEPLOYMENT.md`** documents the hybrid topology (Vercel edge frontend → ALB → Fargate → Supabase/Upstash) end to end: provisioning the managed stores, storing secrets in SSM, building and pushing to ECR, `terraform init/plan/apply`, running `init_db` against Supabase, configuring Vercel, redeploying, teardown, and cost.
-- **⚠️ Documented blocker:** the ALB provisions an **HTTP-only** listener, because an HTTPS listener needs an ACM certificate and a domain that Terraform cannot invent. A Vercel-hosted frontend is served over HTTPS and browsers **block mixed active content**, so every API call to an `http://` ALB fails — the stack would look deployed and be unusable. `DEPLOYMENT.md` leads with this and gives the HTTPS listener + redirect + ACM steps to close it.
-- **Verified by `terraform fmt`, `init`, and `validate` against the real `hashicorp/aws` provider schema** (run through the `hashicorp/terraform:1.9` Docker image rather than installing Terraform on the host). The configuration is **valid but has never been applied** — no AWS resources were created, so runtime behavior (task startup, target health, secret resolution) is unverified.
-- `.gitignore` now excludes `*.tfstate*`, `*.tfplan`, `.terraform/`, and `terraform.tfvars`, while deliberately **tracking** `.terraform.lock.hcl` (it pins provider versions). State is the critical exclusion: it stores resolved secret values in plaintext.
-
----
-
-## Row-Level Security enforcement (post-Module-12 hardening)
-
-Closes the isolation gap that had been documented as open since Module 9.
-
-**The root cause was the connection role, not the policies.** Postgres exempts
-`SUPERUSER` and `BYPASSRLS` roles from every RLS policy *unconditionally* — no
-table-level flag overrides that, `FORCE ROW LEVEL SECURITY` included (verified
-directly against this database: with `FORCE` set, an admin connection still
-read every tenant's rows). The policies were correct all along; the app simply
-connected as `postgres`.
-
-- **`init_db()` now provisions a restricted role.** `settings.app_db_role`
-  (default `sourceguard_app`) is created with `LOGIN`, explicitly altered
-  `NOSUPERUSER NOBYPASSRLS` (in case it pre-existed with either), and granted
-  `SELECT/INSERT/UPDATE/DELETE` on the app tables plus `USAGE` on the schema —
-  no DDL, no ownership. `ALTER DEFAULT PRIVILEGES` covers tables added by
-  later migrations. It is deliberately **not** the table owner: an owner
-  bypasses RLS unless `FORCE` is set, and resting isolation on one easily
-  missed flag is a worse design than simply not being the owner.
-- **Two connection URLs.** `ADMIN_DATABASE_URL` (superuser) is used *only* by
-  `init_db` for DDL; `DATABASE_URL` is the restricted runtime role. The admin
-  URL falls back to `DATABASE_URL` when unset so a single-URL local bootstrap
-  still works.
-- **RLS extended to all five tenant tables** — `workspaces`, `documents`,
-  `document_chunks`, `chat_sessions`, `chat_messages`. `documents` and
-  `document_chunks` previously had none; their policies reach the owner
-  through the parent workspace, so a row is visible only when its entire
-  ancestry is owned by the caller. `init_db` is now the single source of
-  truth for every policy (the chat policies had been created by the temporary
-  Module 10 migration script and were missing from a fresh bootstrap).
-- **Policies read `NULLIF(current_setting('app.current_user_id', true), '')::uuid`.**
-  The `NULLIF` is load-bearing: `current_setting(..., true)` returns NULL when
-  never set, but an *empty string* once cleared, and `''::uuid` raises
-  `invalid input syntax for type uuid` — turning a cleared context into a
-  query error rather than a clean "no rows". `NULLIF` collapses both to NULL
-  so the policy fails closed. Verified both paths.
-- With no `FOR` clause the policies are `FOR ALL`, and with `WITH CHECK`
-  omitted the `USING` expression governs writes too — so a caller cannot
-  insert a row it would not be allowed to read. Confirmed: an attempt to
-  insert a workspace owned by another user is rejected.
-
-**The tenant variable is now session-scoped, not transaction-scoped.**
-`get_authenticated_db` sets it via `set_config(..., false)`. Transaction scope
-looks more conservative and is wrong here: several endpoints commit
-mid-request (`create_workspace` commits then refreshes; `stream_query` saves
-the user turn, generates, then saves the assistant turn), and a
-transaction-scoped setting is discarded at each commit — every subsequent
-query would run with no tenant context and, under enforced RLS, correctly
-return nothing, breaking the request. This latent bug was invisible while RLS
-was inert, because the superuser bypassed the policies regardless.
-
-Session scope introduces a pooled-connection risk in exchange, which
-`get_db` closes: its `finally` clears the variable before the connection
-returns to the pool, so a later request that never sets one cannot inherit the
-previous user's context. Verified — after teardown the next session reads `''`
-and sees zero rows.
-
-**Verified against live Postgres, connected as the restricted role:**
-
-| Check | Result |
+| Table | Predicate |
 | --- | --- |
-| Role attributes | `rolsuper=false`, `rolbypassrls=false` |
-| All five tables | `relrowsecurity=true`, `relforcerowsecurity=true` |
-| User A lists workspaces | sees only A's |
-| User B lists workspaces | sees only B's |
-| A inserts a row owned by B | blocked by the policy |
-| No tenant context set | 0 rows (fails closed) |
-| Cross-tenant document access via API | 404 |
-| Full request flow (create → upload → multi-commit stream) | works end to end |
-| Context after request teardown | cleared, no leak |
+| `workspaces` | `user_id = app_current_tenant()` |
+| `documents` | `workspace_id IN (SELECT id FROM workspaces WHERE user_id = app_current_tenant())` |
+| `document_chunks` | two hops, via `documents JOIN workspaces` |
+| `chat_sessions` | `user_id = app_current_tenant()` |
+| `chat_messages` | `session_id IN (SELECT id FROM chat_sessions WHERE user_id = app_current_tenant())` |
 
-The 114-test suite runs on SQLite, which has no RLS, so it cannot exercise
-any of the above — hence the direct Postgres verification. The suite continues
-to pass unchanged.
+Each is `FOR ALL` with a matching `WITH CHECK`, so a caller cannot write a
+row it would not be allowed to read. Every column the predicates filter on is
+indexed; without that, each policy evaluation is a sequential scan on the
+parent table.
 
-## Project Status
+### Why the connection role is the actual control
 
-**All twelve modules across both phases are complete.** Phase 1 (Modules 1–4)
-delivered ingestion, the vector/relational store, hybrid retrieval with
-claim verification, and the streaming API. Phase 2 (Modules 5–12) delivered
-the frontend, auth and multi-tenancy, rate limiting, conversation memory,
-layout-aware ingestion, and containerization/CI/IaC. **114 backend tests
-pass**; `tsc`, `eslint`, and `next build` are clean; both Docker images build
-and run; the Terraform configuration validates.
+**PostgreSQL exempts `SUPERUSER` and `BYPASSRLS` roles from every policy,
+unconditionally.** No table-level flag overrides this — `FORCE ROW LEVEL
+SECURITY` extends policies to the table *owner*, not to a superuser. The
+project's first implementation connected as `postgres`, so correct,
+visible, audited policies enforced precisely nothing.
 
-The multi-tenant isolation gap that previously qualified this status is
-closed: **Row-Level Security is now enforced by Postgres**, not merely
-defined. What remains below is deferred infrastructure and verification work,
-not a correctness or security defect.
+`init_db` therefore provisions a restricted `sourceguard_app` role:
+`NOSUPERUSER NOBYPASSRLS`, CRUD grants only, never DDL, and deliberately not
+the table owner. Two connection strings exist as a result — an admin URL for
+bootstrap, and the runtime URL that the application actually uses.
 
-**Security**
-- ✅ **RLS is enforced** on all five tenant tables, by the database, as of the
-  post-Module-12 hardening pass. Application-layer checks remain as a second
-  layer.
-- `Workspace.name` is globally unique rather than per-user, so two tenants
-  cannot both have a workspace named "Research". A uniqueness-constraint
-  change, not an isolation gap — RLS already prevents cross-tenant reads.
-- The ALB terminates HTTP only; TLS is required before the Vercel frontend
-  can talk to it at all. **Deferred** — needs an ACM certificate and a domain.
-  Steps are in `DEPLOYMENT.md`.
+### Session scope, and what it costs
 
-**Verification**
-- The Terraform configuration validates but has never been applied — no AWS
-  runtime behavior has been observed.
-- The frontend has no interactive browser-level verification (no
-  browser-automation tool available in the development environment); it is
-  covered by builds, type/lint checks, and contract tests against the real
-  backend.
-- RLS policies and the `set_config` tenant wiring cannot be exercised by the
-  test suite, which runs on SQLite.
+The tenant variable is set with `set_config(..., false)` — **session** scope,
+not transaction scope. Several endpoints commit mid-request, and a
+transaction-scoped setting is discarded at each commit, so every subsequent
+query would run with no tenant and correctly return nothing.
 
-**Deferred product work**
-- Workspace creation still uses `window.prompt` rather than an in-app form
-  (deferred since Module 5).
-- CI tests and builds but does not deploy; image pushes and `terraform apply`
-  are manual.
-- One third-party deprecation warning remains from `starlette/testclient.py`,
-  deliberately not suppressed.
+The consequence is a deployment constraint: a **transaction-mode** connection
+pooler (Supabase port 6543) returns the backend connection to the pool
+between transactions, which both breaks the context and risks handing a
+backend carrying one tenant's variable to another client. Session-mode
+pooling (port 5432) is mandatory. That trades connection-ceiling headroom for
+correctness, which is the right direction — a connection limit is a capacity
+problem you can measure; a tenant-isolation bug is unacceptable at any scale.
 
+Background tasks need the same treatment for a different reason: they outlive
+the request and therefore its session, so `tenant_session()` re-establishes
+the context on its own connection. Without it, every insert from a background
+task would be rejected by the policies meant to govern it.
+
+### Defense in depth
+
+RLS is the backstop, not the only check. `ensure_workspace_owner` and
+`_load_owned_document` verify ownership in application code as well, because
+RLS is inert on the SQLite test database and skippable by a misconfigured
+role. Both return an identical **404** for "does not exist" and "belongs to
+someone else", so IDs cannot be enumerated by comparing responses.
+
+---
+
+## 3. The verification pipeline
+
+```
+ ┌──────────────┐
+ │  User query  │
+ └──────┬───────┘
+        ▼
+ ┌──────────────────────────────────────────────┐
+ │ 1. RETRIEVAL — hybrid                        │
+ │    pgvector cosine ANN  +  Postgres FTS      │
+ │    fused by Reciprocal Rank Fusion (k=60)    │
+ └──────┬───────────────────────────────────────┘
+        │  context_texts: list[str]
+        ▼
+ ┌──────────────────────────────────────────────┐
+ │ 2. GENERATION — Groq, streamed               │
+ │    context + role-attributed history         │
+ │    tokens forwarded as SSE as they arrive    │
+ └──────┬───────────────────────────────────────┘
+        │  full_answer: str
+        ▼
+ ┌──────────────────────────────────────────────┐
+ │ 3. CLAIM DECOMPOSITION                       │
+ │    split on (?<=[.!?])\s+                    │
+ └──────┬───────────────────────────────────────┘
+        │  claims: list[str]
+        ▼
+ ┌──────────────────────────────────────────────┐
+ │ 4. SCORING — per claim, against every chunk  │
+ │    score = |matched keywords| / |keywords|   │
+ │    best-matching chunk wins                  │
+ │      ≥ 0.60  → entailed                      │
+ │      ≤ 0.25  → insufficient_evidence         │
+ │      else    → not_entailed                  │
+ └──────┬───────────────────────────────────────┘
+        │  ClaimVerification[]
+        ▼
+ ┌──────────────────────────────────────────────┐
+ │ 5. PERSISTENCE — two-step write              │
+ │    answer saved → verdicts attached (JSONB)  │
+ └──────────────────────────────────────────────┘
+```
+
+### Retrieval: why Reciprocal Rank Fusion
+
+Dense embeddings capture semantic similarity — "revenue decline" matches
+"profits fell" — but miss rare exact tokens like error codes and SKUs. Sparse
+full-text search is the mirror image. Hybrid covers both, but the two produce
+**incomparable score scales**: cosine distance is bounded, `ts_rank` is
+unbounded and corpus-relative. Any weighted blend needs a normalisation
+constant that is arbitrary and drifts as the corpus grows.
+
+RRF discards magnitude entirely and uses only rank position:
+
+```
+score(id) = Σ  1 / (k + rank_in_list)      k = 60
+```
+
+Scale-free by construction, and it has no tuning parameter that goes stale.
+
+### Scoring: what it is, and what it is not
+
+**This is a deterministic lexical heuristic, not a neural entailment model.**
+The module is named `nli_verifier.py` and its vocabulary is NLI's
+(`EntailmentLabel`, thresholds, per-claim verdicts), but the scoring function
+is keyword coverage: the fraction of a claim's content words that appear as
+whole words in the best-matching retrieved chunk.
+
+That choice is defensible on its merits — deterministic, explainable, zero
+model dependencies, no download, and fully exercisable offline, which is why
+the entire test suite runs without network access. It is also genuinely
+limited: **it cannot detect negation** ("the contract does *not* expire"
+scores identically to the affirmative) **or pure paraphrase**.
+
+The critical implementation detail is word-boundary matching. Every keyword
+test uses `\b{keyword}\b`. Without it, "cat" counts as supported by source
+text containing "category" or "concatenate" — a false `entailed`, which is
+exactly the failure this product exists to prevent. A dedicated regression
+test guards it.
+
+The module is structured so `_score_claim_against_chunk` can be replaced by a
+DeBERTa/NLI cross-encoder **without touching** decomposition, aggregation,
+thresholds, the SSE contract, or the UI. That is the intended upgrade path.
+
+### Aggregation
+
+```python
+overall_score      = round(mean(claim.score for claim in claims), 4)
+is_fully_supported = all(claim.label == ENTAILED for claim in claims)
+```
+
+Both are **derived on read**, never stored. `aggregate_claims()` is the single
+definition, shared by live verification and by history replay — a second copy
+would drift and make a restored answer score differently from the one the
+user originally saw.
+
+### Persistence, and the two-step write
+
+The assistant turn is saved the moment streaming ends; verdicts are attached
+in a **second** write afterwards. Folding both into one write would mean a
+verifier failure costs the response itself rather than just its audit trail.
+
+Historical rows are deliberately not backfilled. Verdicts cannot be
+reconstructed after the fact: re-running the verifier would score old answers
+against *today's* retrieved chunks, not the chunks those answers came from. A
+fabricated audit trail is worse than an absent one, so those rows keep `NULL`
+and the UI states that verdicts are unavailable.
+
+### Streaming contract
+
+| Event | Payload | When |
+| --- | --- | --- |
+| `session` | `{session_id}` | First, before any token |
+| `token` | `{token}` | Per generated token |
+| `verification` | `{claim, label, score}` | Per claim, after generation |
+| `done` | `{answer, session_id, overall_score, is_fully_supported}` | Last |
+| `error` | `{detail}` | Terminal failure |
+
+`session` is emitted first so a client starting a new conversation learns its
+id even if the stream later errors — it can still continue the thread.
+
+The frontend hand-parses SSE off `fetch` + `ReadableStream`, because the
+browser's native `EventSource` is **GET-only** and this endpoint is a POST
+with a JSON body. The parser strips the trailing `\r` from `sse-starlette`'s
+CRLF-terminated frames, and returns `null` for unrecognised events rather
+than throwing, so one malformed frame cannot abort a good stream.
+
+---
+
+## 4. Asynchronous ingestion
+
+```
+POST /documents/upload
+   │  validate filename + extension synchronously  →  400 on failure
+   │  INSERT document (status='pending')
+   │  COMMIT                       ← before scheduling; a task against an
+   │                                 uncommitted row finds nothing to update
+   └─ 202 Accepted {document_id, status_url}
+            │
+            ▼  BackgroundTask (in-process)
+      tenant_session(user_id)      ← re-establishes RLS context
+            │
+      status='processing'
+            │
+      parse → chunk → embed (paced 15/min) → INSERT chunks
+            │
+      status='completed', chunk_count=N        [or 'failed' + error_message]
+```
+
+**Zero chunks is a failure.** A PDF with no text layer previously committed
+as `completed` with `chunk_count=0`: the upload looked successful and the
+document was silently absent from every answer. It now fails with an
+actionable message naming OCR as the likely need.
+
+**Every status write is verified.** An `UPDATE` matching no rows commits
+happily in SQL, so a document deleted mid-ingestion — or one filtered out by
+RLS because the tenant context went missing — would have been reported as
+ingested while writing nothing. The rowcount is checked and a mismatch raises.
+
+**Failures are recorded in a fresh session.** Whatever failed may have left
+the original transaction aborted, where every further statement raises; the
+failure write is the only channel the user can still observe.
+
+---
+
+## 5. Rate limiting
+
+Two independent mechanisms, often confused:
+
+**Inbound (per user).** A sliding-window log in a Redis sorted set, executed
+as a single atomic Lua script — `ZREMRANGEBYSCORE`, `ZCARD`, limit check,
+`ZADD`, `EXPIRE`. Atomicity matters: a Python-side check-then-write lets two
+concurrent requests both read `count = 9` and both proceed. Keyed by
+authenticated `user_id`, not IP, so it cannot be sidestepped by rotating
+addresses. **Fails open** on `RedisError` — a Redis outage should not take
+the API down with it.
+
+**Outbound (to the embedding provider).** Three cooperating parts:
+
+| Mechanism | Value | Purpose |
+| --- | --- | --- |
+| Pacer | 4.0 s between request *starts* | Bounds the rate to 15/min |
+| Semaphore | 2 concurrent | Bounds in-flight connections |
+| Backoff | 2 s × 2ⁿ, 5 retries, proportional jitter | Absorbs 429s |
+
+The pacer is what actually bounds the rate. A per-task `sleep(2)` with two
+workers still yields ~60 requests/minute, because the workers sleep in
+parallel — only spacing the *starts* holds an average. `Retry-After` is
+honoured when present. Only 429 is retried; a 400 is deterministic and
+retrying it burns quota while delaying an error the caller needs.

@@ -2,39 +2,37 @@
 
 # SourceGuard
 
-**Retrieval-augmented answers, verified against source.**
+**Retrieval-augmented answers with a per-claim audit trail.**
 
-Every claim in a generated answer is decomposed and checked against the
-retrieved context *before* it reaches the user — not just cited, but scored.
+Every sentence an answer makes is decomposed, scored against the retrieved
+source, and labelled — before the reader is asked to trust it.
 
+[![Backend Tests](https://img.shields.io/badge/backend%20tests-169%20passing-brightgreen)](#testing)
+[![Frontend Tests](https://img.shields.io/badge/frontend%20tests-81%20passing-brightgreen)](#testing)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Next.js](https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white)](https://nextjs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://github.com/pgvector/pgvector)
-[![Redis](https://img.shields.io/badge/Redis-rate--limiting-DC382D?logo=redis&logoColor=white)](https://redis.io/)
-[![Docker](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
-[![Render](https://img.shields.io/badge/Render-backend-46E3B7?logo=render&logoColor=white)](https://render.com/)
-[![Vercel](https://img.shields.io/badge/Vercel-frontend-000000?logo=vercel&logoColor=white)](https://vercel.com/)
-[![Terraform](https://img.shields.io/badge/Terraform-AWS_ECS_(alt)-7B42BC?logo=terraform&logoColor=white)](https://www.terraform.io/)
-[![Tests](https://img.shields.io/badge/tests-114_passing-brightgreen)](#testing)
-[![RLS](https://img.shields.io/badge/tenant_isolation-DB--enforced_RLS-critical)](#security)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector%203072d-4169E1?logo=postgresql&logoColor=white)](https://github.com/pgvector/pgvector)
+[![Supabase](https://img.shields.io/badge/Supabase-Auth%20%2B%20DB-3FCF8E?logo=supabase&logoColor=white)](https://supabase.com/)
+[![Tenant Isolation](https://img.shields.io/badge/tenant%20isolation-DB--enforced%20RLS-critical)](#multi-tenancy-enforced-by-the-database-not-the-orm)
 
 </div>
 
 ---
 
-## The problem
+## Executive summary
 
-Standard RAG reduces hallucination but does not eliminate it. The model still
-produces fluent prose that *sounds* grounded, and the reader has no way to
-tell which sentences the source documents actually support. Citations point at
-evidence; they do not evaluate it. In legal, financial, or compliance work,
-that leaves the reviewer re-reading the sources anyway — erasing the gain.
+Two things block LLM adoption inside organisations that actually have
+something to lose: **answers that sound right and aren't**, and **data that
+must not leak between customers**. SourceGuard is built around both.
 
-**SourceGuard evaluates.** It decomposes each generated answer into individual
-claims, scores every claim against the retrieved context, and streams the
-verdicts into a live audit panel:
+**On hallucination.** Standard RAG reduces fabrication but cannot eliminate
+it, and citations don't close the gap — a citation asserts that a chunk is
+*related*, not that a sentence is *supported*. SourceGuard decomposes each
+generated answer into individual claims, scores every claim against the
+chunks actually retrieved for that query, and streams the verdicts into a
+live audit panel:
 
 | Verdict | Meaning |
 | --- | --- |
@@ -42,51 +40,93 @@ verdicts into a live audit panel:
 | 🔴 `not_entailed` | Partial support — treat with caution |
 | 🟡 `insufficient_evidence` | The source does not substantiate this claim |
 
+Those verdicts are **persisted**, so reopening a conversation months later
+replays the audit trail rather than the bare text.
+
+**On isolation.** Tenant separation is enforced by PostgreSQL Row-Level
+Security, not by application code remembering to add a `WHERE` clause. A
+forgotten filter in a new endpoint cannot leak another tenant's data, because
+the database refuses to return it.
+
 ---
 
-## Architecture
+## Key features
+
+**Verified generation**
+- Sentence-level claim decomposition with a per-claim verdict and score
+- Word-boundary matching (`\bcat\b` never matches "category") — the
+  false-positive class this product exists to prevent
+- Verdicts stored as JSONB and replayed on reload, with `NULL` (not recorded)
+  kept distinct from `[]` (verified, nothing flagged)
+
+**Multi-tenancy**
+- RLS policies on all five tenant tables, enforced via a restricted,
+  non-superuser database role
+- Supabase JWT (ES256, verified against JWKS) → Postgres session variable →
+  policy evaluation
+- Application-layer ownership checks alongside RLS, returning an identical
+  404 for "absent" and "not yours" so IDs can't be enumerated
+
+**Asynchronous ingestion**
+- Upload returns `202 Accepted` with a per-document status URL
+- Layout-aware PDF parsing: tables extracted to Markdown, headings detected
+  relative to each document's own body font size
+- Semantic chunking — tables stay atomic, headings bind to their content
+- Frontend polling hook drives the UI from *pending* through to *completed*
+
+**Production engineering**
+- Custom request pacer and exponential backoff around a 15 req/min API quota
+- Cascading deletes that report exact blast radius before and after
+- Complete auth suite: login, signup, password reset, resend confirmation
+- **250 automated tests** (169 backend, 81 frontend), no network required
+
+---
+
+## System architecture
 
 ```mermaid
 flowchart TB
-    subgraph client["Client"]
+    subgraph client["Browser"]
         UI["Next.js 16 · App Router<br/>Streaming chat + audit panel"]
     end
 
-    subgraph api["FastAPI Backend"]
-        direction TB
+    subgraph vercel["Vercel"]
+        FE["Static + edge runtime"]
+    end
+
+    subgraph render["Render · FastAPI"]
         AUTH["JWT verification<br/>ES256 via JWKS"]
         RL["Rate limiter<br/>Redis sliding window"]
-        RLS_CTX["Tenant context<br/>SET app.current_user_id"]
-        ING["Ingestion<br/>layout parse → semantic chunk → embed"]
-        RET["Hybrid retrieval<br/>pgvector ANN + full-text → RRF"]
-        GEN["Generation<br/>Groq token stream"]
-        VER["Verification<br/>claim decomposition + entailment"]
+        TEN["Tenant context<br/>SET app.current_user_id"]
+        API["REST + SSE endpoints"]
+        BG["BackgroundTasks<br/>parse → chunk → embed"]
+        VER["Verification<br/>claim decomposition + scoring"]
     end
 
-    subgraph data["Data"]
-        PG[("PostgreSQL + pgvector<br/>RLS enforced")]
-        RD[("Redis")]
+    subgraph data["Managed data"]
+        PG[("Supabase Postgres<br/>pgvector 3072d · RLS")]
+        RD[("Upstash Redis")]
     end
 
-    subgraph ext["External"]
+    subgraph ext["External APIs"]
         SB["Supabase Auth"]
-        GQ["Groq"]
-        TG["Together AI"]
+        GEM["Google Gemini<br/>embeddings"]
+        GROQ["Groq<br/>generation"]
     end
 
-    UI -->|"Bearer JWT"| AUTH
+    UI --> FE
+    FE -->|"Bearer JWT"| AUTH
     AUTH -.->|"fetch JWKS"| SB
     AUTH --> RL
     RL <--> RD
-    RL --> RLS_CTX
-    RLS_CTX --> ING
-    RLS_CTX --> RET
-    ING -->|embeddings| TG
-    ING --> PG
-    RET <--> PG
-    RET --> GEN
-    GEN -->|stream| GQ
-    GEN --> VER
+    RL --> TEN
+    TEN --> API
+    API -->|"202 Accepted"| BG
+    BG -->|"paced 15/min"| GEM
+    BG --> PG
+    API --> PG
+    API --> VER
+    VER -->|stream| GROQ
     VER -->|"SSE: token · verification · done"| UI
 ```
 
@@ -96,19 +136,16 @@ flowchart TB
 sequenceDiagram
     participant B as Browser
     participant A as FastAPI
-    participant R as Redis
     participant P as Postgres
     participant L as Groq
 
     B->>A: POST /query/stream (JWT)
     A->>A: Verify ES256 JWT via JWKS
-    A->>R: Sliding-window check (atomic Lua)
     A->>P: SET app.current_user_id → RLS active
     A->>P: Hybrid search (pgvector + FTS → RRF)
-    A->>P: Load last 10 conversation turns
+    A->>P: Load conversation window
     A-->>B: event: session
     loop Streaming
-        A->>L: Generate with context + history
         L-->>A: token
         A-->>B: event: token
     end
@@ -116,64 +153,82 @@ sequenceDiagram
     loop Per claim
         A-->>B: event: verification
     end
-    A->>P: Persist both turns
+    A->>P: Persist turns + claims (JSONB)
     A-->>B: event: done
 ```
 
 ---
 
-## Features
+## Engineering highlights
 
-**Verified generation**
-- Sentence-level claim decomposition with per-claim entailment scoring
-- Word-boundary–enforced matching (`\bcat\b` never matches "category" — a
-  false-positive class this product exists to prevent)
-- Live audit panel populated as verdicts arrive, not after the fact
+### Asynchronous ingestion, because the work outlives the request
 
-**Layout-aware ingestion**
-- Tables extracted via PyMuPDF `find_tables()` and rendered to **Markdown**, so
-  row/column relationships survive into the embedding
-- Headings detected *relative* to each document's own body font size
-- Chunking on semantic boundaries: tables stay atomic, headings bind to the
-  content they introduce, splits land between elements — never mid-sentence
+Embedding is paced to 15 requests per minute by the provider's free tier, and
+Gemini's OpenAI-compatibility layer rejects batched input — so each chunk is
+its own request. A 50-chunk PDF therefore takes **over three minutes of
+wall-clock**, far longer than any browser, proxy, or platform will hold an
+HTTP connection open. Synchronous upload wasn't slow; it was impossible.
 
-**Hybrid retrieval**
-- Dense pgvector ANN + sparse Postgres full-text search
-- Merged by **Reciprocal Rank Fusion** (rank-position based, so two
-  incomparable score scales never need arbitrary normalization)
+Upload now returns `202 Accepted` immediately with a per-document status URL,
+and the work runs in a FastAPI `BackgroundTask`. The interesting part is what
+that breaks. A background task outlives the request, so it outlives the
+request's database session — including the tenant context that RLS depends
+on. It needed its own session factory that re-establishes that context, or
+every insert would be rejected by the very policies meant to govern it.
 
-**Conversation memory**
-- Multi-turn sessions with a 10-message sliding window
-- History injected as role-attributed messages, not flattened into the prompt
+Choosing `BackgroundTasks` over a broker-backed queue (ARQ, Celery) was a
+deliberate constraint-driven trade: those require a separate worker process,
+which the free tier doesn't offer. The cost is honest and documented — an
+in-process task doesn't survive a restart — so a reaper marks documents
+stranded in `processing` as failed rather than leaving the UI polling forever.
 
-**Production engineering**
-- 114 backend tests, no network or services required (~5s)
-- Multi-stage Docker builds, non-root, Next.js standalone output
-- GitHub Actions CI: pytest + typecheck + lint + build
-- Deployed on Render + Vercel; Terraform for AWS ECS Fargate retained as the
-  enterprise-scale alternative
+The subtlest bug here produced no error at all: a PDF with no text layer
+yields zero chunks, and the pipeline committed that as `completed`. The
+upload looked successful, the document appeared in the sidebar, and it was
+silently absent from every answer. Zero chunks is now a failure with an
+actionable message.
 
----
+### Rate limiting that actually bounds the rate
 
-## Security
+The obvious fix for `429 Too Many Requests` is a semaphore plus a sleep. It
+doesn't work: two concurrent workers each sleeping two seconds still issue
+roughly 60 requests per minute — four times the quota — because they sleep in
+parallel.
 
-### Database-enforced tenant isolation
+What bounds a *rate* is the spacing between request **starts**. A small pacer
+serialises reservations behind a lock so no two requests begin closer than
+`60 / 15 = 4` seconds apart, holding the average at exactly the quota
+regardless of how long each call takes. The semaphore (capped at 2) then
+bounds in-flight connections, and exponential backoff with **proportional**
+jitter handles the 429s that still slip through — honouring `Retry-After`
+when the server sends it, since that's the provider stating precisely when
+the window reopens.
 
-Row-Level Security is **enforced by PostgreSQL**, not merely defined, on all
-five tenant tables: `workspaces`, `documents`, `document_chunks`,
-`chat_sessions`, `chat_messages`.
+Only `429` is retried. A `400` is deterministic; retrying it burns quota and
+delays an error the caller needs to see.
 
-This distinction is the point. PostgreSQL exempts `SUPERUSER` and `BYPASSRLS`
-roles from every policy **unconditionally** — so an application connecting as
-`postgres` gets policies that are syntactically correct, visible in
-`pg_policies`, and enforcing nothing.
+### Multi-tenancy enforced by the database, not the ORM
 
-SourceGuard therefore connects as a restricted `sourceguard_app` role that
-`init_db` provisions with `NOSUPERUSER NOBYPASSRLS`, granted CRUD only — never
-DDL, and deliberately not the table owner (an owner bypasses RLS absent
-`FORCE`).
+This is the part of the system I'd most want reviewed, because the first
+implementation was wrong in a way that looked right.
 
-Verify any deployment in one query:
+RLS policies existed on every tenant table. They were syntactically correct
+and visible in `pg_policies`. They were enforcing **nothing** — because the
+application connected as `postgres`, and PostgreSQL exempts `SUPERUSER` and
+`BYPASSRLS` roles from every policy *unconditionally*. No table-level flag
+overrides that; `FORCE ROW LEVEL SECURITY` extends policies to the table
+owner, not to a superuser. A configuration audit would have shown green.
+
+The fix was a restricted `sourceguard_app` role provisioned `NOSUPERUSER
+NOBYPASSRLS` with CRUD grants only — never DDL, and deliberately not the table
+owner. Enforcing RLS then exposed a second, latent bug: the tenant variable
+was transaction-scoped, and several endpoints commit mid-request, so every
+query after the first ran with no tenant set. Invisible while the policies
+were inert, because the superuser bypassed them anyway.
+
+Isolation is now verified **behaviourally** — a second user reading the first
+user's rows returns zero rows — rather than by asserting the policies exist.
+Any deployment can be checked in one query:
 
 ```sql
 SELECT current_user, rolsuper, rolbypassrls
@@ -181,19 +236,58 @@ FROM pg_roles WHERE rolname = current_user;
 -- rolsuper and rolbypassrls must BOTH be false
 ```
 
-Isolation is verified behaviorally — a second user reading the first user's
-rows returns **zero rows** — rather than by asserting the policies exist.
+### Persisting the audit trail
 
-### Additional controls
+Verification verdicts were computed per response and never stored, so
+reopening a workspace replayed the answers stripped of every verdict — which
+reads as *unverified*, a stronger and wronger claim than *not recorded*.
 
-| Control | Implementation |
-| --- | --- |
-| Authentication | Supabase ES256 JWTs verified via JWKS; fails closed on missing/expired/wrong-audience tokens |
-| Defense in depth | Application-layer ownership checks alongside RLS; identical 404 for "absent" and "not yours", so IDs cannot be enumerated |
-| Rate limiting | Per-`user_id` sliding window (10 queries/min, 20 uploads/min) via an atomic Redis Lua script |
-| Upload hardening | Path-traversal and disguised-extension rejection before any parsing; fail-fast batches |
-| Secrets | Loaded from environment (platform env vars on Render/Vercel; SSM ARNs on the AWS path), never baked into images or Terraform state |
-| CORS | Explicit origin allow-list, no wildcards |
+A `claims` JSONB column now stores per-claim verdicts, written in a
+deliberate two-step: the answer is persisted the moment streaming ends, and
+verdicts are attached afterwards, so a verifier failure costs the audit trail
+for that turn rather than the response itself. Aggregates (`overall_score`,
+`is_fully_supported`) are **derived on read** from a shared function rather
+than stored, so a summary can never drift out of step with the claims it
+summarises.
+
+`NULL` and `[]` are kept rigorously distinct throughout — `NULL` means no
+verdicts were recorded, `[]` means verified with nothing flagged. Collapsing
+them would relabel an unverified answer as clean, which is precisely the
+false assurance this product exists to prevent. Historical rows are
+deliberately **not** backfilled: re-running the verifier would score old
+answers against today's retrieved chunks, and a fabricated audit trail is
+worse than an absent one.
+
+---
+
+## The "no staging environment" trade-off
+
+There is no staging server. That was a decision, not an omission.
+
+A staging environment costs a second copy of every managed service and a
+continuous reconciliation burden, and it catches a class of bug — environment
+drift — that this stack largely doesn't have: the same Docker image runs
+locally, in CI, and in production, and infrastructure is declarative. Paying
+that cost for a single-maintainer project would have bought less safety per
+hour than the alternative.
+
+The risk is carried by four things instead:
+
+1. **250 automated tests** that require no network, no Postgres, and no Redis
+   — the suite runs in ~7 seconds, so it's actually run.
+2. **Mutation testing.** Every non-obvious guarantee was verified by breaking
+   it and confirming a test fails. A test that passes against broken code is
+   worse than no test, and this caught several.
+3. **Vercel preview deployments**, giving every frontend change a real URL on
+   real infrastructure before it reaches production.
+4. **Verified-by-behaviour checks for anything the test suite structurally
+   cannot cover** — RLS enforcement and cascade semantics were exercised
+   against a live PostgreSQL instance with the restricted role, because the
+   SQLite test database has no RLS to enforce.
+
+The honest limitation: this catches logic regressions well and
+infrastructure-interaction bugs poorly. The mitigation is that the surface
+where those bugs live is small and documented.
 
 ---
 
@@ -201,20 +295,20 @@ rows returns **zero rows** — rather than by asserting the policies exist.
 
 | Layer | Technology |
 | --- | --- |
+| Frontend | Next.js 16 (App Router), React 19, TypeScript strict, Tailwind CSS v4 |
 | Backend | Python 3.11+, FastAPI, Pydantic v2, SQLAlchemy 2.0 (async) |
-| Database | PostgreSQL + pgvector, RLS-enforced |
-| Cache | Redis (sliding-window rate limiting) |
-| Frontend | Next.js 16 (App Router), TypeScript strict, Tailwind CSS v4 |
+| Database | Supabase PostgreSQL + pgvector (3072d), RLS-enforced |
+| Cache | Upstash Redis — sliding-window rate limiting via atomic Lua |
 | Auth | Supabase (ES256 / JWKS) |
-| AI | Groq (generation), Together AI (embeddings) — both with offline mocks |
-| Ingestion | PyMuPDF layout parsing (no system dependencies) |
-| Observability | LangSmith via explicit `@traceable` spans |
-| Hosting | **Render** (backend) · **Vercel** (frontend) · Supabase · Upstash |
-| Infra | Docker, Docker Compose, GitHub Actions; Terraform/AWS ECS Fargate as an alternative |
+| Embeddings | Google Gemini (`gemini-embedding-001`) |
+| Generation | Groq (streaming) |
+| Ingestion | PyMuPDF — layout-aware, no system dependencies |
+| Hosting | Vercel (frontend) · Render (backend) |
+| Testing | pytest · Vitest · React Testing Library |
 
 ---
 
-## Quick start
+## Getting started
 
 ### Prerequisites
 
@@ -241,22 +335,16 @@ APP_DB_PASSWORD="choose-a-password" python -m app.db.init_db
 uvicorn app.main:app --reload
 ```
 
-Then create `backend/.env`, pointing `DATABASE_URL` at the **restricted role**
-just created:
+Then create `backend/.env`, pointing `DATABASE_URL` at the **restricted role**:
 
 ```bash
 DATABASE_URL=postgresql+asyncpg://sourceguard_app:<password>@localhost:5432/sourceguard
 SUPABASE_URL=https://<project-ref>.supabase.co
 ```
 
-> Pointing `DATABASE_URL` at a superuser silently disables RLS. See
-> [Security](#security).
->
-> On Supabase, `DATABASE_URL` must also use a **session-mode** connection
-> (port **5432**), never the transaction-mode pooler (port **6543**). The RLS
-> tenant context is a session-scoped variable; transaction-mode pooling
-> returns the connection between transactions, which breaks the context and
-> can leak it across tenants. See [`DEPLOYMENT.md`](DEPLOYMENT.md).
+> Pointing `DATABASE_URL` at a superuser silently disables RLS. On Supabase,
+> use the **session-mode** connection (port 5432), never the transaction
+> pooler (6543) — the tenant context is a session-scoped variable.
 
 ### Frontend
 
@@ -266,154 +354,34 @@ npm install
 npm run dev     # http://localhost:3000
 ```
 
-Create `frontend/.env.local`:
-
 ```bash
-NEXT_PUBLIC_API_URL=http://127.0.0.1:8000/api/v1
+# frontend/.env.local
+NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
 NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
 NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<publishable-key>
 ```
 
-> Use `http://localhost:3000`, **not** `http://127.0.0.1:3000` — the CORS
-> allow-list contains the former only, and browsers treat them as distinct
-> origins.
-
 **With no AI provider keys set, the entire pipeline runs offline** on
 deterministic mocks — including the full test suite.
-
-### Environment reference
-
-| Variable | Required | Notes |
-| --- | --- | --- |
-| `DATABASE_URL` | yes | Must be the restricted, non-superuser role. On Supabase, use the **session-mode** connection (port **5432**) — see below |
-| `ADMIN_DATABASE_URL` | bootstrap | Superuser connection, used only by `init_db` |
-| `APP_DB_PASSWORD` | bootstrap | Password assigned to the restricted role |
-| `APP_DB_ROLE` | no | Defaults to `sourceguard_app` |
-| `SUPABASE_URL` | yes | Project URL; builds the JWKS endpoint. Not a secret |
-| `REDIS_URL` | no | Defaults to `redis://localhost:6379/0` |
-| `GROQ_API_KEY` | no | Unset ⇒ deterministic offline mock generation |
-| `TOGETHER_API_KEY` | no | Unset ⇒ deterministic offline mock embeddings |
-| `LANGSMITH_API_KEY` | no | Required for tracing |
-| `LANGCHAIN_TRACING_V2` / `LANGSMITH_TRACING` | no | `true` enables tracing |
-
----
-
-## Docker
-
-```bash
-docker compose up --build
-```
-
-Frontend → `http://localhost:3000` · Backend → `http://localhost:8000`
-
-Postgres and Redis are intentionally **not** in `docker-compose.yml` — the
-local setup already runs them on the standard ports, and redeclaring them
-would collide on 5432/6379. The services reach them via
-`host.docker.internal`.
-
-`NEXT_PUBLIC_*` are inlined at **build** time, so they are passed as build
-args rather than runtime environment:
-
-```bash
-export NEXT_PUBLIC_SUPABASE_URL=https://<ref>.supabase.co
-export NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<publishable-key>
-docker compose up --build
-```
-
-`NEXT_PUBLIC_API_URL` defaults to `http://localhost:8000/api/v1`, **not**
-`http://backend:8000` — that URL is fetched by the browser, which runs on the
-host and cannot resolve compose service names.
 
 ---
 
 ## Testing
 
 ```bash
-cd backend && source venv/bin/activate && pytest      # 114 tests, ~5s
-cd frontend && npx tsc --noEmit && npx eslint . && npm run build
+cd backend && source venv/bin/activate && pytest       # 169 tests, ~7s
+cd frontend && npm test                                # 81 tests, ~1s
 ```
 
 The backend suite runs entirely against in-memory SQLite — no Postgres, no
-Redis, no network. This is possible because `PortableVector` compiles to a
+Redis, no network. That's possible because `PortableVector` compiles to a
 native `pgvector` column on PostgreSQL and a JSON-encoded `Text` column
 elsewhere, so tests exercise the **real production ORM models** rather than a
 parallel mock schema.
 
-PostgreSQL-specific behavior that SQLite cannot express — RLS enforcement,
-the `<=>` operator, full-text search — is verified directly against a live
-instance.
-
-Run the suite in the same Python version CI uses:
-
-```bash
-docker build -t sourceguard-backend ./backend
-docker run --rm sourceguard-backend python -m pytest -q
-```
-
----
-
-## Ingestion dependencies
-
-**No system-level packages required** — no `poppler`, no `tesseract`.
-
-Layout parsing is built on PyMuPDF, a self-contained Python wheel.
-[`unstructured`](https://github.com/Unstructured-IO/unstructured) offers
-higher layout fidelity but requires system binaries and downloads
-ONNX/detectron weights on first use, which would break two standing project
-constraints: no local model downloads, and a fully offline dev/test path.
-
-Tradeoff accepted: no OCR, so scanned PDFs are unsupported.
-
----
-
-## CI
-
-`.github/workflows/ci.yml` runs on push and pull request against `main`:
-
-- **backend** — Python 3.11, pip-cached, `pytest`
-- **frontend** — Node 22, npm-cached, `tsc --noEmit`, `eslint`, `next build`
-
-No service containers needed: SQLite, faked Redis, and offline AI mocks mean
-CI requires no Postgres, no Redis, and no network egress.
-
----
-
-## Project structure
-
-```
-backend/
-  app/
-    api/          endpoints + dependencies (auth, RLS context, rate limiting)
-    db/           async engine, session lifecycle, RLS bootstrap
-    models/       SQLAlchemy models incl. PortableVector
-    schemas/      Pydantic contracts
-    services/     parsing, chunking, embeddings, retrieval, generation,
-                  verification, conversation memory, telemetry
-  tests/          114 tests
-frontend/
-  src/
-    app/          App Router (dashboard route group + login)
-    components/   ChatPanel, Sidebar, DocumentUpload, WorkspaceDocuments
-    lib/          API client incl. hand-rolled SSE parser
-infrastructure/   Terraform: ECS Fargate, ALB, VPC, IAM
-```
-
----
-
-## Deployment
-
-**Primary:** [Render](https://render.com/) (backend, Docker) +
-[Vercel](https://vercel.com/) (frontend), on managed Supabase and Upstash —
-$0 fixed cost, automatic HTTPS on both, deploys on `git push`.
-
-**Alternative:** `infrastructure/` contains validated Terraform for AWS ECS
-Fargate behind an ALB, with a VPC, security-group chaining, and
-least-privilege IAM. It is retained as the enterprise-scale migration target
-(network isolation, auditable IAM, metric-driven autoscaling) rather than the
-live deployment — roughly $57/month versus $0, which the current traffic does
-not justify.
-
-Full step-by-step for both paths: [`DEPLOYMENT.md`](DEPLOYMENT.md).
+PostgreSQL-specific behaviour that SQLite cannot express — RLS enforcement,
+the `<=>` operator, JSONB round-tripping — is verified directly against a
+live instance.
 
 ---
 
@@ -421,25 +389,27 @@ Full step-by-step for both paths: [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 | Document | Contents |
 | --- | --- |
-| [`DESIGN.md`](DESIGN.md) | Full as-built architecture and the reasoning behind each non-obvious decision |
-| [`WORKLOG.md`](WORKLOG.md) | Chronological build history across all twelve modules |
-| [`DEPLOYMENT.md`](DEPLOYMENT.md) | Deployment: Render + Vercel (primary), with AWS ECS Fargate as an alternative |
+| [`DESIGN.md`](DESIGN.md) | Schema, RLS strategy, and the verification pipeline |
+| [`WORKLOG.md`](WORKLOG.md) | Chronological build history |
+| [`DEPLOYMENT.md`](DEPLOYMENT.md) | Render + Vercel deployment, with AWS as an alternative |
+| [`CLAUDE.md`](CLAUDE.md) | Engineering rules and hand-over notes |
 
 ---
 
-## Status
+## Known limitations
 
-All twelve modules across both phases are complete. 114 backend tests pass;
-typecheck, lint, and build are clean; both Docker images build and run; the
-Terraform configuration validates.
+Stated plainly, because a portfolio project that claims none isn't credible:
 
-**Known deferred work** — documented rather than hidden:
-
-- The Terraform validates but has never been applied to a live AWS account;
-  on that path the ALB terminates HTTP only, so TLS requires an ACM
-  certificate and a domain (steps in `DEPLOYMENT.md`). Not applicable to the
-  primary Render/Vercel deployment, which provides HTTPS automatically.
-- Document upload is synchronous; large files warrant a job queue
-- Verification is lexical-overlap based, structured for replacement by a
-  DeBERTa/NLI cross-encoder without touching decomposition or aggregation
-- No OCR path for scanned PDFs
+- **Verification is lexical, not neural.** Claims are scored by keyword
+  coverage against retrieved chunks, not by a trained entailment model. It
+  cannot detect negation ("the contract does *not* expire") or pure
+  paraphrase. The module is deliberately structured so the scoring function
+  can be replaced by a DeBERTa/NLI cross-encoder without touching
+  decomposition, aggregation, thresholds, the SSE contract, or the UI.
+- **No OCR.** Scanned PDFs have no text layer and are rejected with a
+  message saying so rather than silently ingesting as empty.
+- **Background tasks are in-process.** They don't survive a restart; stranded
+  documents are reaped rather than resumed.
+- **3072 dimensions exceeds pgvector's 2000-dimension ceiling for `ivfflat`
+  and `hnsw` indexes.** Retrieval is currently a sequential scan, which is
+  fine at present corpus size; ANN indexing would require the `halfvec` type.
